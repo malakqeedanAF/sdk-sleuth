@@ -6,6 +6,12 @@ All notable changes to sdk-sleuth are documented here.
 
 ### Added / Changed
 
+- **`setup.command`** — guided, re-runnable first-time setup: checks/installs
+  Homebrew, python3, fzf and gh (asks before installing), signs in to GitHub,
+  verifies and saves a GitLab token (`~/.sdk-sleuth/gitlab_token`). Flags:
+  `--check`, `--yes`. The tool now also reads that token file when
+  `GITLAB_TOKEN` is not set.
+
 - **Detective-style UI** — block-letter banner with a magnifier, rotating
   tagline, rounded boxes, a step tracker (`● ● ◉ ○ ○  Step 3/5`) and a live
   "Case file" panel showing platform, account, repo, version range and term.

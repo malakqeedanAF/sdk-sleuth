@@ -672,7 +672,15 @@ def gitlab_base():
 
 
 def gitlab_token():
-    return os.environ.get("GITLAB_TOKEN", "").strip().strip('"').strip("'")
+    """GITLAB_TOKEN env var, else the token file written by setup.command."""
+    tok = os.environ.get("GITLAB_TOKEN", "").strip().strip('"').strip("'")
+    if not tok:
+        try:
+            with open(os.path.expanduser("~/.sdk-sleuth/gitlab_token")) as f:
+                tok = f.read().strip()
+        except OSError:
+            pass
+    return tok
 
 
 def gitlab_headers(token):
@@ -1210,7 +1218,7 @@ def step_platform(state, direction):
     screen(state, 0, big=True)
     items = [
         ("GitHub", f"{BOLD}GitHub{RESET}  {DIM}github.com · uses your gh CLI login{RESET}"),
-        ("GitLab", f"{BOLD}GitLab{RESET}  {DIM}{gitlab_base().split('://')[-1]} · uses $GITLAB_TOKEN{RESET}"),
+        ("GitLab", f"{BOLD}GitLab{RESET}  {DIM}{gitlab_base().split('://')[-1]} · GitLab token{RESET}"),
     ]
     choice = fzf_pick(items, "Platform", header="Where does the case begin?", back="quit")
     if choice is BACK:
@@ -1234,7 +1242,7 @@ def step_account(state, direction):
                 f"{BOLD}GITLAB_TOKEN is not set.{RESET}",
                 "Create a personal access token (scope: read_api) at:",
                 f"  {gitlab_base()}/-/user_settings/personal_access_tokens",
-                "Then add to ~/.zshrc:  export GITLAB_TOKEN=glpat-xxxxxxxx",
+                "Then add to ~/.zshrc:  export GITLAB_TOKEN=glpat-xxxxxxxx  (or run ./setup.command)",
                 f"{DIM}(open a brand-new Terminal window afterwards){RESET}",
             ], title="GitLab token missing")
             pause()

@@ -18,8 +18,13 @@ Flow:
 2. Pick an account (GitHub) or token (GitLab — set `GITLAB_TOKEN` first).
 3. Pick a repo from your favorites, browse an org/owner, or paste a URL.
 4. Pick a version range from the repo's releases (or default branch only).
-5. Enter a search term — results are reported per version, with a clear
-   "✓ found" / "✗ not found" marker for each one.
+5. Enter a search term — results open in an interactive browser (version ▸
+   file ▸ line) where you can expand/collapse, open or copy links.
+
+Every step has a way back: the `← Back` entry, `Esc` / `Ctrl-B`, or an empty
+input at text prompts (`:q` quits). Browser keys: `↑↓` move, `Enter`/`→`
+expand, `←` collapse, `1 2 3` depth, `e`/`c` all, `o` open, `y` copy link,
+`p` print report, `b` back, `q` quit.
 
 ## Requirements
 

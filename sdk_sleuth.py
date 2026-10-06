@@ -15,6 +15,10 @@ Requires: python3, fzf. GitHub auth uses the `gh` CLI (already logged in).
 GitLab auth uses the GITLAB_TOKEN env var.
 """
 import base64
+import bisect
+import difflib
+import hashlib
+import itertools
 import json
 import locale
 import os
@@ -23,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import unicodedata
@@ -30,7 +35,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib import error, parse, request
 
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 # ---------- colors ----------
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -300,6 +305,7 @@ def case_file_lines(state):
         rows.append(f"{DIM}{label:<9}{RESET} {value}")
 
     if state.platform:
+        add("Mode", f"{BOLD}{'Compare' if state.mode == 'compare' else 'Search'}{RESET}")
         add("Platform", f"{BOLD}{state.platform}{RESET}")
     if state.account_label:
         add("Account", f"{BOLD}{state.account_label}{RESET}")
@@ -312,7 +318,9 @@ def case_file_lines(state):
     return rows
 
 
-STEP_TITLES = ["Platform", "Account", "Repository", "Versions", "Search"]
+def step_titles(state):
+    return ["Mode", "Platform", "Account", "Repository", "Versions",
+            "Compare" if state.mode == "compare" else "Search"]
 
 
 def screen(state, idx, big=False, subtitle=""):
@@ -329,11 +337,13 @@ def screen(state, idx, big=False, subtitle=""):
         lines.append(f"{DIM}  v{VERSION} · GitHub + GitLab · search a function across SDK versions{RESET}")
     else:
         lines.append(f"{BOLD}{CYAN}◆ sdk-sleuth{RESET} {DIM}v{VERSION}{RESET}")
+    titles = step_titles(state)
+    cur = idx + 1  # callers pass the index without the Mode step
     dots = " ".join(
-        f"{GREEN}●{RESET}" if i < idx else (f"{CYAN}{BOLD}◉{RESET}" if i == idx else f"{DIM}○{RESET}")
-        for i in range(len(STEP_TITLES))
+        f"{GREEN}●{RESET}" if i < cur else (f"{CYAN}{BOLD}◉{RESET}" if i == cur else f"{DIM}○{RESET}")
+        for i in range(len(titles))
     )
-    lines.append(f"{dots}  {BOLD}Step {idx + 1}/{len(STEP_TITLES)}{RESET} {DIM}·{RESET} {BOLD}{STEP_TITLES[idx]}{RESET}"
+    lines.append(f"{dots}  {BOLD}Step {cur + 1}/{len(titles)}{RESET} {DIM}·{RESET} {BOLD}{titles[cur]}{RESET}"
                  + (f"  {DIM}{subtitle}{RESET}" if subtitle else ""))
     case = case_file_lines(state)
     if case:
@@ -649,7 +659,7 @@ def gh_search_version(owner, repo, ref, term, token, on_progress=None):
             for i, line in enumerate(text.splitlines(), start=1):
                 if term_lower in line.lower():
                     hits.append({
-                        "path": entry["path"], "line": i, "text": snippet(line, term),
+                        "path": entry["path"], "line": i, "text": snippet(line, term), "blob": entry["sha"],
                         "url": f"https://github.com/{owner}/{repo}/blob/{ref or sha}/{entry['path']}#L{i}",
                     })
         return hits
@@ -796,8 +806,8 @@ class VersionResult:
         self.files = sorted(files.items())
 
 
-def run_search(state, term):
-    versions = state.range
+def run_search(state, term, versions=None):
+    versions = versions or state.range
     n = len(versions)
     results = []
     for i, (ref, meta) in enumerate(versions):
@@ -1157,7 +1167,9 @@ def _browse(scr, state, results, term):
 # ======================== wizard state + steps ========================
 class State:
     def __init__(self):
+        self.mode = "search"
         self.platform = None
+        self.default_branch = None
         self.gh_account = None
         self.gh_token = None
         self.gl_token = None
@@ -1187,6 +1199,7 @@ class State:
 
     def set_repo(self, repo, project_id=None):
         self.repo, self.project_id = repo, project_id
+        self.default_branch = None
         self.repo_label = repo
         if not repo:
             self.repo_url = None
@@ -1199,6 +1212,18 @@ class State:
         if self.platform == "GitHub":
             return f"https://github.com/{self.repo}/releases/tag/{parse.quote(tag, safe='')}"
         return f"{gitlab_base()}/{self.repo}/-/releases/{parse.quote(tag, safe='')}"
+
+    def file_url(self, ref, path):
+        ref = ref or self.default_branch or "HEAD"
+        if self.platform == "GitHub":
+            return f"https://github.com/{self.repo}/blob/{parse.quote(ref, safe='/')}/{path}"
+        return f"{gitlab_base()}/{self.repo}/-/blob/{ref}/{path}"
+
+    def compare_url(self, base, head):
+        base, head = base or self.default_branch or "HEAD", head or self.default_branch or "HEAD"
+        if self.platform == "GitHub":
+            return f"https://github.com/{self.repo}/compare/{parse.quote(base, safe='')}...{parse.quote(head, safe='')}"
+        return f"{gitlab_base()}/{self.repo}/-/compare/{parse.quote(base, safe='')}...{parse.quote(head, safe='')}"
 
     def range_summary(self):
         if not self.range:
@@ -1215,14 +1240,14 @@ class State:
 
 
 def step_platform(state, direction):
-    screen(state, 0, big=True)
+    screen(state, 0)
     items = [
         ("GitHub", f"{BOLD}GitHub{RESET}  {DIM}github.com · uses your gh CLI login{RESET}"),
         ("GitLab", f"{BOLD}GitLab{RESET}  {DIM}{gitlab_base().split('://')[-1]} · GitLab token{RESET}"),
     ]
-    choice = fzf_pick(items, "Platform", header="Where does the case begin?", back="quit")
+    choice = fzf_pick(items, "Platform", header="Where does the case begin?")
     if choice is BACK:
-        return "quit"
+        return "back"
     if state.platform != choice:
         state.reset_after("platform")
         state.platform = choice
@@ -1419,6 +1444,12 @@ def step_versions(state, direction):
     if not state.releases:
         if direction == "back":
             return "back"
+        if state.mode == "compare":
+            notice("warn", ["Compare needs formal releases to pick two versions from.",
+                            "This repo has none."], title="No releases")
+            print()
+            pause()
+            return "back"
         notice("warn", ["This repo has no formal releases.", "The search will run on the default branch only."],
                title="No releases")
         state.range = [(None, None)]
@@ -1433,24 +1464,52 @@ def step_versions(state, direction):
         date = fmt_date(state.releases[tag].get("released_at"))
         return (tag, f"{BOLD}{tag:<18}{RESET} {CYAN}{date}{RESET}")
 
-    items = [default_item] + [item(t) for t in newest_first]
+    cols = f"VERSION            RELEASED (yyyy/mm/dd)"
+    from_items = [item(t) for t in tags] + [default_item]  # oldest -> newest
+
+    def to_items(frm):
+        """Only versions from `frm` upwards, newest first (default branch counts as newest)."""
+        if frm is None:  # default branch has nothing newer: offer everything, newest first
+            return [default_item] + [item(t) for t in newest_first]
+        newer = [t for t in newest_first if version_key(t) >= version_key(frm)]
+        if state.mode == "compare":
+            newer = [t for t in newer if t != frm]
+        return [default_item] + [item(t) for t in newer]
+
     phase, frm = "from", None
     while True:
         if phase == "from":
             screen(state, 3)
-            frm = fzf_pick(items, "From", header=f"Oldest version of the range · {len(tags)} releases · newest first\n"
-                                                 f"VERSION            RELEASED (yyyy/mm/dd)")
+            frm = fzf_pick(from_items, "From", header=f"Oldest version of the range · {len(tags)} releases · oldest first\n{cols}")
             if frm is BACK:
                 return "back"
             phase = "to"
         else:
             screen(state, 3, subtitle=f"· from {frm or 'default branch'}")
-            to = fzf_pick(items, "To", header=f"Newest version of the range (from: {frm or 'default branch'})\n"
-                                              f"VERSION            RELEASED (yyyy/mm/dd)")
+            to = fzf_pick(to_items(frm), "To", header=f"Newest version of the range (from {frm or 'default branch'} upwards) · newest first\n{cols}")
             if to is BACK:
                 phase = "from"
                 continue
             break
+
+    if state.mode == "compare":
+        if frm == to:
+            notice("warn", ["Pick two different versions to compare."], title="Same version")
+            print()
+            pause()
+            return step_versions(state, "fwd")
+        if frm is None:
+            pair = [to, None]
+        elif to is None:
+            pair = [frm, None]
+        else:
+            pair = sorted([frm, to], key=version_key)
+        if pair[1] is None:
+            state.range = [(pair[0], state.releases.get(pair[0])), (None, None)]
+        else:
+            i1, i2 = tags.index(pair[0]), tags.index(pair[1])
+            state.range = [(t, state.releases.get(t)) for t in tags[i1:i2 + 1]]
+        return "next"
 
     if frm is None or to is None:
         single = frm or to
@@ -1505,7 +1564,1022 @@ def step_search(state, direction):
             return "quit"
 
 
-STEPS = [step_platform, step_account, step_repo, step_versions, step_search]
+# ======================== compare: data layer ========================
+def http_text(url, headers=None, timeout=30):
+    req = request.Request(url)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+    except error.HTTPError as e:
+        raise RuntimeError(f"HTTP {e.code} for {url}")
+    except error.URLError as e:
+        raise RuntimeError(f"network error for {url}: {e.reason}")
+
+
+def count_patch(patch):
+    a = d = 0
+    for ln in (patch or "").split("\n"):
+        if ln.startswith("+"):
+            a += 1
+        elif ln.startswith("-"):
+            d += 1
+    return a, d
+
+
+def gh_compare(owner, repo, base, head, token):
+    """Files changed between two refs (GitHub caps the list at 300 files)."""
+    files, page = [], 1
+    spec = f"{parse.quote(base, safe='')}...{parse.quote(head, safe='')}"
+    while True:
+        data, _ = gh_api(f"repos/{owner}/{repo}/compare/{spec}", token, {"per_page": 100, "page": page})
+        batch = (data or {}).get("files", [])
+        files.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    out = []
+    for f in files:
+        status = f.get("status", "modified")
+        status = status if status in ("added", "removed", "renamed") else "modified"
+        out.append({"path": f["filename"], "old_path": f.get("previous_filename"), "status": status,
+                    "add": f.get("additions", 0), "del": f.get("deletions", 0), "patch": f.get("patch")})
+    return out, len(files) >= 300
+
+
+def gl_compare(project_id, base, head, token):
+    data, _ = gitlab_api(f"projects/{project_id}/repository/compare", token,
+                         {"from": base, "to": head, "straight": "true"})
+    out = []
+    for d in (data or {}).get("diffs", []):
+        status = ("added" if d.get("new_file") else "removed" if d.get("deleted_file")
+                  else "renamed" if d.get("renamed_file") else "modified")
+        a, r = count_patch(d.get("diff"))
+        out.append({"path": d["new_path"], "old_path": d.get("old_path"), "status": status,
+                    "add": a, "del": r, "patch": d.get("diff")})
+    return out, bool((data or {}).get("compare_timeout"))
+
+
+def resolve_ref(state, ref):
+    """A concrete ref name; None means the repo's default branch."""
+    if ref:
+        return ref
+    if not state.default_branch:
+        if state.platform == "GitHub":
+            data, _ = gh_api(f"repos/{state.repo}", state.gh_token)
+        else:
+            data, _ = gitlab_api(f"projects/{state.project_id}", state.gl_token)
+        state.default_branch = (data or {}).get("default_branch") or "HEAD"
+    return state.default_branch
+
+
+def tree_map(state, ref):
+    """path -> blob id for every file at ref."""
+    if state.platform == "GitHub":
+        owner, name = state.repo.split("/", 1)
+        sha = gh_resolve_sha(owner, name, resolve_ref(state, ref), state.gh_token)
+        return {e["path"]: e["sha"] for e in gh_get_tree(owner, name, sha, state.gh_token) if e.get("type") == "blob"}
+    out, page = {}, 1
+    while True:
+        data, hdrs = gitlab_api(f"projects/{state.project_id}/repository/tree", state.gl_token,
+                                {"recursive": "true", "ref": resolve_ref(state, ref), "per_page": 100, "page": page})
+        for e in data or []:
+            if e.get("type") == "blob":
+                out[e["path"]] = e["id"]
+        if not hdrs.get("x-next-page"):
+            return out
+        page = int(hdrs["x-next-page"])
+
+
+def blob_text(state, sha):
+    if state.platform == "GitHub":
+        owner, name = state.repo.split("/", 1)
+        return gh_get_blob_text(owner, name, sha, state.gh_token)
+    d = os.path.join(CACHE_DIR, "gl_blobs", sha[:2])
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, sha)
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    text = http_text(f"{gitlab_base()}/api/v4/projects/{state.project_id}/repository/blobs/{sha}/raw",
+                     gitlab_headers(state.gl_token))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return text
+
+
+def tree_compare(state, base_ref, head_ref, max_patches=600):
+    """Diff two refs by file tree + blob ids. Works even when the histories are unrelated."""
+    A, B = tree_map(state, base_ref), tree_map(state, head_ref)
+    added = [p for p in B if p not in A]
+    removed = [p for p in A if p not in B]
+    modified = [p for p in B if p in A and A[p] != B[p]]
+    files, gone = [], {}
+    for p in removed:
+        gone.setdefault(A[p], []).append(p)
+    for p in list(added):  # same content under a new path = rename
+        olds = gone.get(B[p])
+        if olds:
+            old = olds.pop(0)
+            files.append({"path": p, "old_path": old, "status": "renamed", "add": 0, "del": 0, "patch": None})
+            added.remove(p)
+            removed.remove(old)
+    jobs = [("modified", p) for p in modified] + [("added", p) for p in added] + [("removed", p) for p in removed]
+    done, total = 0, min(len(jobs), max_patches)
+
+    def work(job):
+        status, p = job
+        if p.rsplit(".", 1)[-1].lower() in BINARY_EXT:
+            return {"path": p, "old_path": None, "status": status, "add": 0, "del": 0, "patch": None}
+        a = blob_text(state, A[p]) if p in A else ""
+        b = blob_text(state, B[p]) if p in B else ""
+        lines = list(difflib.unified_diff(a.split("\n"), b.split("\n"), lineterm="", n=3))[2:]
+        patch = "\n".join(lines)
+        ad, de = count_patch(patch)
+        return {"path": p, "old_path": None, "status": status, "add": ad, "del": de, "patch": patch}
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futs = []
+        for i, job in enumerate(jobs):
+            if i < max_patches:
+                futs.append(ex.submit(work, job))
+            else:
+                files.append({"path": job[1], "old_path": None, "status": job[0], "add": 0, "del": 0, "patch": None})
+        for fut in as_completed(futs):
+            try:
+                files.append(fut.result())
+            except RuntimeError:
+                pass
+            done += 1
+            draw_progress(done / max(total, 1), f"diffing files {done}/{total}", force=(done == total))
+    clear_progress()
+    note = "ℹ histories are unrelated — compared by file contents"
+    if len(jobs) > max_patches:
+        note += f" (diffs shown for the first {max_patches} of {len(jobs)} files)"
+    return files, note
+
+
+def fetch_compare(state, base_ref, head_ref):
+    """Returns (files, note). Falls back to a file-tree diff when the compare API can't (unrelated tags)."""
+    base, head = resolve_ref(state, base_ref), resolve_ref(state, head_ref)
+    try:
+        if state.platform == "GitHub":
+            owner, name = state.repo.split("/", 1)
+            files, truncated = gh_compare(owner, name, base, head, state.gh_token)
+        else:
+            files, truncated = gl_compare(state.project_id, base, head, state.gl_token)
+        return files, ("⚠ the server lists at most 300 files — narrow with the filter" if truncated else "")
+    except RuntimeError:
+        clear_progress()
+        return tree_compare(state, base_ref, head_ref)
+
+
+def get_file_text(state, ref, path, blob=None):
+    """Text of path at ref. GitHub uses the cached blob when we know its SHA."""
+    if state.platform == "GitHub" and blob:
+        owner, name = state.repo.split("/", 1)
+        return gh_get_blob_text(owner, name, blob, state.gh_token)
+    concrete = resolve_ref(state, ref)
+    cache = None
+    if ref:  # tags are stable, so they are safe to cache; the default branch is not
+        key = hashlib.sha1(f"{state.repo}|{ref}|{path}".encode()).hexdigest()
+        d = os.path.join(CACHE_DIR, "files", key[:2])
+        os.makedirs(d, exist_ok=True)
+        cache = os.path.join(d, key)
+        if os.path.exists(cache):
+            with open(cache, encoding="utf-8", errors="ignore") as f:
+                return f.read()
+    if state.platform == "GitHub":
+        url = f"https://api.github.com/repos/{state.repo}/contents/{parse.quote(path)}?ref={parse.quote(concrete, safe='')}"
+        hdrs = dict(gh_headers(state.gh_token), Accept="application/vnd.github.raw+json")
+    else:
+        url = (f"{gitlab_base()}/api/v4/projects/{state.project_id}/repository/files/"
+               f"{parse.quote(path, safe='')}/raw?ref={parse.quote(concrete, safe='')}")
+        hdrs = gitlab_headers(state.gl_token)
+    text = http_text(url, hdrs)
+    if cache:
+        with open(cache, "w", encoding="utf-8") as f:
+            f.write(text)
+    return text
+
+
+# ======================== compare: symbol extraction ========================
+def _skip_literal(t, i):
+    """If a comment or string starts at t[i], return the index just past it, else None."""
+    c = t[i]
+    if c == "/" and t.startswith("//", i):
+        j = t.find("\n", i)
+        return len(t) if j < 0 else j
+    if c == "/" and t.startswith("/*", i):
+        j = t.find("*/", i + 2)
+        return len(t) if j < 0 else j + 2
+    if c in "\"'`":
+        if t.startswith(c * 3, i):
+            j = t.find(c * 3, i + 3)
+            return len(t) if j < 0 else j + 3
+        j = i + 1
+        while j < len(t):
+            if t[j] == "\\":
+                j += 2
+                continue
+            if t[j] == c:
+                return j + 1
+            if t[j] == "\n" and c != "`":
+                return j
+            j += 1
+        return len(t)
+    return None
+
+
+def _match_close(t, i, open_c, close_c, limit=200000):
+    """t[i] is open_c; return the index of its matching close_c, or -1."""
+    depth, n = 0, min(len(t), i + limit)
+    while i < n:
+        s = _skip_literal(t, i)
+        if s is not None:
+            i = max(s, i + 1)
+            continue
+        c = t[i]
+        if c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+_PREFIX_BAD = re.compile(r"(\.|=|\(|,|!|&&|\|\||\+|\?)\s*$|\b(return|new|throw|else|await|yield|in|is|as)\s*$")
+_ANNOT = re.compile(r"^\s*(@\w|\[[A-Za-z]\w*.*\]\s*$)")
+
+
+def _py_blocks(text, term):
+    lines = text.split("\n")
+    pat = re.compile(r"^([ \t]*)(?:async[ \t]+)?(?:def|class)[ \t]+" + re.escape(term) + r"\b", re.I | re.M)
+    blocks = []
+    for m in pat.finditer(text):
+        li = text.count("\n", 0, m.start())
+        indent = len(m.group(1).replace("\t", "    "))
+        depth, k = 0, li
+        while k < len(lines):  # skip a multi-line signature
+            depth += lines[k].count("(") - lines[k].count(")")
+            if depth <= 0:
+                break
+            k += 1
+        end = k
+        for j in range(k + 1, len(lines)):
+            ln = lines[j]
+            if ln.strip() and len(ln) - len(ln.lstrip()) <= indent:
+                break
+            if ln.strip():
+                end = j
+        sl = li
+        while sl > 0 and lines[sl - 1].strip().startswith("@"):
+            sl -= 1
+        blocks.append((sl, min(end, sl + 400), li))
+    return lines, blocks
+
+
+def extract_blocks(text, term, path=""):
+    """Definition blocks (function / method / class bodies) whose name is `term`."""
+    lines = text.split("\n")
+    found = []
+    if path.endswith((".py", ".pyi")):
+        lines, spans = _py_blocks(text, term)
+        found = spans
+    else:
+        starts, off = [], 0
+        for ln in lines:
+            starts.append(off)
+            off += len(ln) + 1
+        pat = re.compile(r"(?<![\w$])" + re.escape(term) + r"\s*(?:<[^>\n]*>)?\s*\(", re.I)
+        last_end = -1
+        for m in pat.finditer(text):
+            li = bisect.bisect_right(starts, m.start()) - 1
+            if li <= last_end:
+                continue
+            prefix = text[starts[li]:m.start()]
+            if prefix.strip().startswith(("//", "*", "/*", "#", '"', "'")) or _PREFIX_BAD.search(prefix):
+                continue
+            close_i = _match_close(text, m.end() - 1, "(", ")")
+            if close_i < 0:
+                continue
+            j, brace, stop = close_i + 1, -1, min(len(text), close_i + 240)
+            while j < stop:
+                if text[j] == "/":
+                    s = _skip_literal(text, j)
+                    if s is not None:
+                        j = max(s, j + 1)
+                        continue
+                c = text[j]
+                if c == "{":
+                    brace = j
+                    break
+                if c in ";()" or (c == "=" and text[j + 1:j + 2] != ">"):
+                    break
+                j += 1
+            if brace < 0:
+                continue
+            end_i = _match_close(text, brace, "{", "}")
+            el = (bisect.bisect_right(starts, end_i) - 1) if end_i >= 0 else li + 60
+            el = min(el, li + 400)
+            sl = li
+            while sl > 0 and _ANNOT.match(lines[sl - 1]):
+                sl -= 1
+            found.append((sl, el, li))
+            last_end = el
+    return [{"start": sl + 1, "end": el + 1, "sig": lines[li].strip()[:120], "kind": "def",
+             "text": textwrap.dedent("\n".join(lines[sl:el + 1]))} for sl, el, li in found]
+
+
+def usage_block(text, term, ctx=2, max_hits=60):
+    """Fallback for parameters / constants / calls: the matching lines with a little context."""
+    lines, tl = text.split("\n"), term.lower()
+    hits = [i for i, ln in enumerate(lines) if tl in ln.lower()][:max_hits]
+    if not hits:
+        return None
+    keep = set()
+    for i in hits:
+        keep.update(range(max(0, i - ctx), min(len(lines), i + ctx + 1)))
+    out, prev = [], -2
+    for i in sorted(keep):
+        if prev >= 0 and i != prev + 1:
+            out.append("⋯")
+        out.append(lines[i])
+        prev = i
+    return {"start": hits[0] + 1, "end": hits[-1] + 1, "sig": lines[hits[0]].strip()[:120], "kind": "usage",
+            "text": textwrap.dedent("\n".join(out))}
+
+
+def blocks_for_file(path, text, term):
+    defs = extract_blocks(text, term, path)
+    if defs:
+        return defs
+    u = usage_block(text, term)
+    return [u] if u else []
+
+
+def norm_text(t):
+    return "\n".join(l.strip() for l in (t or "").split("\n") if l.strip())
+
+
+def pair_blocks(a_map, b_map):
+    """Match blocks of version A with blocks of version B and classify each pair."""
+    A = {(p, i): b for p, bl in a_map.items() for i, b in enumerate(bl)}
+    B = {(p, i): b for p, bl in b_map.items() for i, b in enumerate(bl)}
+    pairs = [(k, k) for k in A if k in B]
+    rest_a = [k for k in A if k not in B]
+    rest_b = [k for k in B if k not in A]
+    for ka in list(rest_a):  # moved to another file: same signature
+        for kb in rest_b:
+            if A[ka]["sig"] == B[kb]["sig"] and A[ka]["kind"] == B[kb]["kind"]:
+                pairs.append((ka, kb))
+                rest_a.remove(ka)
+                rest_b.remove(kb)
+                break
+    entries = []
+    for ka, kb in pairs:
+        a, b = A[ka], B[kb]
+        same = norm_text(a["text"]) == norm_text(b["text"])
+        entries.append({"status": "unchanged" if same else "modified", "fmt_only": same and a["text"] != b["text"],
+                        "path": kb[0], "old_path": ka[0] if ka[0] != kb[0] else None,
+                        "sig": b["sig"], "start": b["start"], "a": a["text"], "b": b["text"], "kind": b["kind"]})
+    for ka in rest_a:
+        a = A[ka]
+        entries.append({"status": "removed", "fmt_only": False, "path": ka[0], "old_path": None, "sig": a["sig"],
+                        "start": a["start"], "a": a["text"], "b": "", "kind": a["kind"]})
+    for kb in rest_b:
+        b = B[kb]
+        entries.append({"status": "added", "fmt_only": False, "path": kb[0], "old_path": None, "sig": b["sig"],
+                        "start": b["start"], "a": "", "b": b["text"], "kind": b["kind"]})
+    order = {"modified": 0, "added": 1, "removed": 2, "unchanged": 3}
+    entries.sort(key=lambda e: (order[e["status"]], e["path"], e["start"]))
+    return entries
+
+
+# ======================== compare: diff rows ========================
+_TOK = re.compile(r"\w+|\s+|[^\w\s]")
+
+
+def _clean(s):
+    return CTRL_RE.sub(" ", s.replace("\t", "    ")).rstrip()
+
+
+def intraline(a, b):
+    ta, tb = _TOK.findall(a), _TOK.findall(b)
+    sm = difflib.SequenceMatcher(None, ta, tb, autojunk=False)
+    sa, sb = [], []
+    for op, i1, i2, j1, j2 in sm.get_opcodes():
+        x, y = "".join(ta[i1:i2]), "".join(tb[j1:j2])
+        if op == "equal":
+            sa.append((x, False))
+            sb.append((y, False))
+        else:
+            if x:
+                sa.append((x, True))
+            if y:
+                sb.append((y, True))
+    return sa, sb
+
+
+def diff_rows(a_text, b_text, ctx=3):
+    """Line diff ignoring whitespace-only changes, with word-level highlights on changed lines."""
+    a = a_text.split("\n") if a_text else []
+    b = b_text.split("\n") if b_text else []
+    sm = difflib.SequenceMatcher(None, [l.strip() for l in a], [l.strip() for l in b], autojunk=False)
+    ops = sm.get_opcodes()
+    rows = []
+    for idx, (op, i1, i2, j1, j2) in enumerate(ops):
+        if op == "equal":
+            n = i2 - i1
+            first, last = idx == 0, idx == len(ops) - 1
+            head = 0 if first and not last else ctx
+            tail = 0 if last and not first else ctx
+            if (first and last) or n <= head + tail + 1:
+                pre, post, gap = list(range(n)), [], 0
+            else:
+                pre, post, gap = list(range(head)), list(range(n - tail, n)), n - head - tail
+            for off in pre:
+                rows.append({"k": "eq", "a_no": i1 + off + 1, "b_no": j1 + off + 1, "text": _clean(b[j1 + off])})
+            if gap:
+                rows.append({"k": "skip", "n": gap})
+            for off in post:
+                rows.append({"k": "eq", "a_no": i1 + off + 1, "b_no": j1 + off + 1, "text": _clean(b[j1 + off])})
+            continue
+        dels, adds = a[i1:i2], b[j1:j2]
+        d_segs = [None] * len(dels)
+        a_segs = [None] * len(adds)
+        if len(dels) == len(adds):
+            for k in range(len(dels)):
+                if difflib.SequenceMatcher(None, dels[k].strip(), adds[k].strip()).ratio() > 0.5:
+                    d_segs[k], a_segs[k] = intraline(_clean(dels[k]), _clean(adds[k]))
+        for k, ln in enumerate(dels):
+            rows.append({"k": "del", "a_no": i1 + k + 1, "text": _clean(ln), "segs": d_segs[k]})
+        for k, ln in enumerate(adds):
+            rows.append({"k": "add", "b_no": j1 + k + 1, "text": _clean(ln), "segs": a_segs[k]})
+    return rows
+
+
+def row_segs(r):
+    k = r["k"]
+    if k == "skip":
+        return [(f"      ⋯ {r['n']} unchanged line(s)", "dim")]
+    if k == "eq":
+        return [(f"{r['b_no']:>5}   ", "dim"), (r["text"], "ctx")]
+    sign, style, no = ("-", "del", r.get("a_no")) if k == "del" else ("+", "add", r.get("b_no"))
+    segs = [(f"{no:>5} ", "dim"), (f"{sign} ", style)]
+    if r.get("segs"):
+        segs += [(t, style + "_hl" if ch else style) for t, ch in r["segs"]]
+    else:
+        segs.append((r["text"], style))
+    return segs
+
+
+def patch_segs(ln):
+    ln = _clean(ln)
+    if ln.startswith("@@"):
+        return [("      " + ln, "hunk")]
+    if ln.startswith("+"):
+        return [("    + ", "add"), (ln[1:], "add")]
+    if ln.startswith("-"):
+        return [("    - ", "del"), (ln[1:], "del")]
+    if ln.startswith("\\"):
+        return [("      " + ln, "dim")]
+    return [("      ", "dim"), (ln[1:] if ln.startswith(" ") else ln, "ctx")]
+
+
+def count_rows(rows):
+    return sum(1 for r in rows if r["k"] == "add"), sum(1 for r in rows if r["k"] == "del")
+
+
+def evolution_groups(items):
+    """items: [(label, date, text)] in version order -> runs of identical (whitespace-insensitive) bodies."""
+    groups = []
+    for label, date, text in items:
+        n = norm_text(text)
+        if groups and groups[-1]["norm"] == n:
+            groups[-1]["labels"].append(label)
+            groups[-1]["dates"].append(date)
+        else:
+            groups.append({"norm": n, "text": text, "labels": [label], "dates": [date]})
+    return groups
+
+
+def combined_text(bmap):
+    parts = []
+    for p in sorted(bmap):
+        for b in bmap[p]:
+            parts.append(f"// ── {p}")
+            parts.append(b["text"])
+    return "\n".join(parts)
+
+
+# ======================== compare: tree viewer ========================
+_NID = itertools.count(1)
+
+
+def mk(segs, children=None, url=None):
+    return {"id": next(_NID), "segs": segs, "children": children, "url": url}
+
+
+def _kids(n):
+    ch = n.get("children")
+    if ch is None:
+        return None
+    if callable(ch):
+        if "_k" not in n:
+            n["_k"] = ch()
+        return n["_k"]
+    return ch
+
+
+def _flatten(nodes, expanded, level=0, url=None, out=None):
+    out = [] if out is None else out
+    for n in nodes:
+        u = n.get("url") or url
+        out.append((level, n, u))
+        if n["id"] in expanded:
+            kids = _kids(n)
+            if kids:
+                _flatten(kids, expanded, level + 1, u, out)
+    return out
+
+
+def _all_ids(nodes, acc=None):
+    acc = set() if acc is None else acc
+    for n in nodes:
+        kids = _kids(n)
+        if kids is not None:
+            acc.add(n["id"])
+            _all_ids(kids, acc)
+    return acc
+
+
+_ANSI_STYLE = {
+    "add": GREEN, "del": RED, "add_hl": _c("30;42"), "del_hl": _c("30;41"), "hunk": CYAN,
+    "cyan": BOLD + CYAN, "ok": BOLD + GREEN, "bad": BOLD + RED, "warn": BOLD + YELLOW,
+    "mag": MAGENTA, "dim": DIM, "bold": BOLD, "hl": HL,
+}
+
+
+def segs_ansi(segs):
+    return "".join(f"{_ANSI_STYLE[s]}{t}{RESET}" if s in _ANSI_STYLE else t for t, s in segs)
+
+
+def _print_tree(header, roots):
+    for h in header:
+        print(segs_ansi(h))
+    print()
+    for level, n, _ in _flatten(roots, _all_ids(roots)):
+        print(" " * (1 + 2 * level) + segs_ansi(n["segs"]))
+
+
+def _curses_styles(curses):
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+        bg = -1
+    except curses.error:
+        bg = curses.COLOR_BLACK
+    C = curses
+    pairs = {1: (C.COLOR_RED, bg), 2: (C.COLOR_GREEN, bg), 3: (C.COLOR_YELLOW, bg), 5: (C.COLOR_MAGENTA, bg),
+             6: (C.COLOR_CYAN, bg), 7: (C.COLOR_BLACK, C.COLOR_GREEN), 8: (C.COLOR_BLACK, C.COLOR_RED),
+             9: (C.COLOR_BLACK, C.COLOR_YELLOW), 10: (C.COLOR_BLACK, C.COLOR_CYAN)}
+    for n, (f, b) in pairs.items():
+        curses.init_pair(n, f, b)
+    cp = curses.color_pair
+    return {"ctx": 0, "dim": C.A_DIM, "bold": C.A_BOLD, "add": cp(2), "del": cp(1),
+            "add_hl": cp(7) | C.A_BOLD, "del_hl": cp(8) | C.A_BOLD, "hunk": cp(6), "cyan": cp(6) | C.A_BOLD,
+            "ok": cp(2) | C.A_BOLD, "bad": cp(1) | C.A_BOLD, "warn": cp(3) | C.A_BOLD, "mag": cp(5),
+            "hl": cp(9) | C.A_BOLD, "bar": cp(10) | C.A_BOLD, "url": cp(6) | C.A_UNDERLINE}
+
+
+def view_tree(title, header, roots, expanded=()):
+    """Expand/collapse tree browser. header: list of seg-lists. Returns 'back' or 'quit'."""
+    expanded = set(expanded)
+    try:
+        import curses
+    except ImportError:
+        curses = None
+    if curses is None or not sys.stdout.isatty():
+        _print_tree(header, roots)
+        pause("Press Enter to go back")
+        return "back"
+    os.environ.setdefault("ESCDELAY", "25")
+    try:
+        return curses.wrapper(lambda scr: _view_tree(scr, title, header, roots, expanded))
+    except curses.error:
+        _print_tree(header, roots)
+        pause("Press Enter to go back")
+        return "back"
+
+
+def _view_tree(scr, title, header, roots, expanded):
+    import curses
+
+    curses.curs_set(0)
+    S = _curses_styles(curses)
+    rows = _flatten(roots, expanded)
+    sel, top, flash = 0, 0, ("", 0.0)
+
+    def put(y, x, text, attr=0):
+        h, w = scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return x
+        text = clip_plain(text, w - x)
+        try:
+            scr.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+        return x + vlen(text)
+
+    def rebuild(keep_id=None):
+        nonlocal rows, sel
+        rows = _flatten(roots, expanded)
+        if keep_id is not None:
+            for i, (_, n, _) in enumerate(rows):
+                if n["id"] == keep_id:
+                    sel = i
+                    break
+        sel = max(0, min(sel, len(rows) - 1))
+
+    def draw():
+        nonlocal top
+        scr.erase()
+        h, w = scr.getmaxyx()
+        put(0, 0, f" sdk-sleuth │ {title} ".ljust(w), S["bar"])
+        for i, segs in enumerate(header):
+            x = 0
+            for t, st in segs:
+                x = put(1 + i, x, t, S.get(st, 0))
+        bs = 2 + len(header)
+        put(bs, 0, "─" * w, S["dim"])
+        bs += 1
+        body_h = max(1, h - bs - 2)
+        if sel < top:
+            top = sel
+        if sel >= top + body_h:
+            top = sel - body_h + 1
+        for i in range(body_h):
+            ri = top + i
+            if ri >= len(rows):
+                break
+            level, n, _ = rows[ri]
+            rev = curses.A_REVERSE if ri == sel else 0
+            y = bs + i
+            if rev:
+                put(y, 0, " " * w, rev)
+            x = put(y, 0, " " * (1 + 2 * level), rev)
+            kids = _kids(n)
+            if kids is not None:
+                x = put(y, x, ("▼ " if n["id"] in expanded else "▶ "), S["cyan"] | rev)
+            else:
+                x = put(y, x, "  ", rev)
+            for t, st in n["segs"]:
+                x = put(y, x, t, S.get(st, 0) | rev)
+        url = rows[sel][2] if rows else None
+        if flash[0] and time.time() - flash[1] < 2.5:
+            put(h - 2, 0, f" ✓ {flash[0]}", S["ok"])
+        elif url:
+            x = put(h - 2, 0, " ↗ ", S["cyan"])
+            put(h - 2, x, url, S["url"])
+        x = 0
+        for k, d in [("↑↓", "move"), ("⏎/→/←", "expand/collapse"), ("e/c", "all"), ("o", "open"),
+                     ("y", "copy link"), ("b", "← back"), ("q", "quit")]:
+            x = put(h - 1, x, f" {k}", S["cyan"])
+            x = put(h - 1, x, f" {d} ", S["dim"])
+        scr.refresh()
+
+    scr.timeout(400)
+    while True:
+        draw()
+        ch = scr.getch()
+        if ch == -1:
+            continue
+        if ch == curses.KEY_RESIZE:
+            scr.clear()
+            continue
+        if not rows:
+            if ch in (ord("b"), 27, ord("q")):
+                return "quit" if ch == ord("q") else "back"
+            continue
+        level, node, url = rows[sel]
+        expandable = _kids(node) is not None
+        h, _ = scr.getmaxyx()
+        page = max(1, h - 6)
+        if ch in (curses.KEY_UP, ord("k")):
+            sel = max(0, sel - 1)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            sel = min(len(rows) - 1, sel + 1)
+        elif ch == curses.KEY_PPAGE:
+            sel = max(0, sel - page)
+        elif ch == curses.KEY_NPAGE:
+            sel = min(len(rows) - 1, sel + page)
+        elif ch in (curses.KEY_HOME, ord("g")):
+            sel = 0
+        elif ch in (curses.KEY_END, ord("G")):
+            sel = len(rows) - 1
+        elif ch in (10, 13, curses.KEY_ENTER, ord(" ")):
+            if expandable:
+                expanded.symmetric_difference_update({node["id"]})
+                rebuild(node["id"])
+            elif url:
+                webbrowser.open(url)
+                flash = ("Opened in browser", time.time())
+        elif ch == curses.KEY_RIGHT:
+            if expandable and node["id"] not in expanded:
+                expanded.add(node["id"])
+                rebuild(node["id"])
+            else:
+                sel = min(len(rows) - 1, sel + 1)
+        elif ch == curses.KEY_LEFT:
+            if expandable and node["id"] in expanded:
+                expanded.discard(node["id"])
+                rebuild(node["id"])
+            elif level > 0:
+                for i in range(sel - 1, -1, -1):
+                    if rows[i][0] == level - 1:
+                        sel = i
+                        break
+        elif ch == ord("e"):
+            expanded |= _all_ids(roots)
+            rebuild(node["id"])
+        elif ch == ord("c"):
+            expanded.clear()
+            rebuild()
+            sel = 0
+        elif ch == ord("o") and url:
+            webbrowser.open(url)
+            flash = ("Opened in browser", time.time())
+        elif ch == ord("y") and url:
+            try:
+                subprocess.run(["pbcopy"], input=url, text=True, check=True)
+                flash = ("Copied link to clipboard", time.time())
+            except Exception:
+                flash = ("Clipboard unavailable", time.time())
+        elif ch in (ord("b"), 27, curses.KEY_BACKSPACE, 127, 8):
+            return "back"
+        elif ch in (ord("q"), ord("Q")):
+            return "quit"
+
+
+# ======================== compare: flows ========================
+FILE_STATUS = {"added": ("A", "ok"), "removed": ("D", "bad"), "modified": ("M", "warn"), "renamed": ("R", "mag")}
+VERDICT_BADGE = {"modified": ("✎ MODIFIED", "warn"), "added": ("✚ ADDED", "ok"),
+                 "removed": ("✗ REMOVED", "bad"), "unchanged": ("= UNCHANGED", "dim")}
+
+
+def compare_labels(state):
+    base, head = state.range[0], state.range[-1]
+    return (base[0] or "default branch"), (head[0] or "default branch")
+
+
+def compare_overview(state):
+    base_ref, head_ref = state.range[0][0], state.range[-1][0]
+    blabel, hlabel = compare_labels(state)
+    screen(state, 4, subtitle=f"· {blabel} → {hlabel}")
+    with Spinner("Asking the server for the diff"):
+        files, note = fetch_compare(state, base_ref, head_ref)
+    if not files:
+        notice("ok", [f"{BOLD}{blabel}{RESET} and {BOLD}{hlabel}{RESET} have identical files."], title="No differences")
+        print()
+        pause()
+        return "back"
+    flt = ask_line(f"{CYAN}❯{RESET} Filter by path {DIM}(text or regex, empty = all {len(files)} files){RESET}: ")
+    if flt:
+        try:
+            rx = re.compile(flt, re.I)
+            files = [f for f in files if rx.search(f["path"])]
+        except re.error:
+            files = [f for f in files if flt.lower() in f["path"].lower()]
+        if not files:
+            notice("warn", [f"No changed file matches “{flt}”."], title="Filter")
+            print()
+            pause()
+            return "back"
+    order = {"added": 0, "removed": 1, "renamed": 2, "modified": 3}
+    files.sort(key=lambda f: (order[f["status"]], f["path"]))
+    counts = {k: sum(1 for f in files if f["status"] == k) for k in order}
+    tot_a, tot_d = sum(f["add"] for f in files), sum(f["del"] for f in files)
+    header = [[(" ", "ctx"), (blabel, "bold"), (" → ", "dim"), (hlabel, "bold"),
+               (f"   {len(files)} file(s)  ", "dim"), (f"+{tot_a}", "add"), (" ", "ctx"), (f"−{tot_d}", "del")],
+              [(" ", "ctx"), (f"A {counts['added']} added", "ok"), ("   ", "ctx"),
+               (f"D {counts['removed']} removed", "bad"), ("   ", "ctx"),
+               (f"M {counts['modified']} modified", "warn"), ("   ", "ctx"),
+               (f"R {counts['renamed']} renamed", "mag")]
+              + ([(f"    {note}", "warn")] if note else [])]
+
+    def patch_children(f):
+        def build():
+            if not f.get("patch"):
+                return [mk([("(no textual patch — binary file or diff too large; open the link)", "dim")])]
+            return [mk(patch_segs(ln)) for ln in f["patch"].split("\n")]
+        return build
+
+    roots = []
+    for f in files:
+        letter, style = FILE_STATUS[f["status"]]
+        d, _, name = f["path"].rpartition("/")
+        segs = [(f"{letter} ", style), ((d + "/") if d else "", "dim"), (name, "bold"),
+                (f"  +{f['add']}", "add"), (f" −{f['del']}", "del")]
+        if f["status"] == "renamed" and f.get("old_path"):
+            segs.append((f"  ← {f['old_path']}", "dim"))
+        ref = head_ref if f["status"] != "removed" else base_ref
+        roots.append(mk(segs, patch_children(f), state.file_url(ref, f["path"])))
+    return view_tree(f"{state.repo_label} │ compare", header, roots)
+
+
+def collect_blocks(state, results, term):
+    """Read the files each version matched in and extract the symbol's blocks. -> [path -> blocks]"""
+    jobs = []
+    for vi, r in enumerate(results):
+        seen = {}
+        for m in r.matches:
+            seen.setdefault(m["path"], m.get("blob"))
+        for p in sorted(seen)[:300]:
+            jobs.append((vi, p, seen[p]))
+    out = [dict() for _ in results]
+    total, done = len(jobs), 0
+
+    def work(job):
+        vi, p, blob = job
+        try:
+            text = get_file_text(state, results[vi].tag, p, blob)
+        except RuntimeError:
+            text = ""
+        return vi, p, blocks_for_file(p, text, term)
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for fut in as_completed([ex.submit(work, j) for j in jobs]):
+            vi, p, bl = fut.result()
+            done += 1
+            draw_progress(done / max(total, 1), f"reading files {done}/{total}", force=(done == total))
+            if bl:
+                out[vi][p] = bl
+    clear_progress()
+    return out
+
+
+def ask_term(state, hint):
+    screen(state, 4, subtitle="· " + " → ".join(compare_labels(state)))
+    print(f"{DIM}  {hint} · empty = ← back{RESET}")
+    term = ask_line(f"{CYAN}❯{RESET} {BOLD}Symbol{RESET} {DIM}(function / parameter / class){RESET}: ",
+                    prefill=state.last_term)
+    if term:
+        state.last_term = term
+    return term
+
+
+def compare_symbol(state):
+    term = ask_term(state, "Did this symbol change between the two versions?")
+    if not term:
+        return "back"
+    blabel, hlabel = compare_labels(state)
+    screen(state, 4)
+    print(f"  {BOLD}Investigating{RESET} {HL} {term} {RESET}  {DIM}{blabel} → {hlabel}{RESET}\n")
+    results = run_search(state, term, [state.range[0], state.range[-1]])
+    errs = [r for r in results if r.err]
+    if errs:
+        notice("error", [f"{r.label}: {r.err[:160]}" for r in errs], title="Search failed")
+        print()
+        pause()
+        return "back"
+    if not any(r.matches for r in results):
+        screen(state, 4)
+        notice("warn", [f"“{term}” does not appear in {blabel} or {hlabel}.",
+                        f"{ITALIC}The case went cold.{RESET}"], title="Not found")
+        print()
+        pause()
+        return "back"
+    blocks = collect_blocks(state, results, term)
+    entries = pair_blocks(blocks[0], blocks[1])
+    counts = {k: sum(1 for e in entries if e["status"] == k) for k in VERDICT_BADGE}
+    changed = counts["modified"] + counts["added"] + counts["removed"]
+    verdict = ("CHANGED", "warn") if changed else ("UNCHANGED", "ok")
+    header = [[(" ", "ctx"), (f" {term} ", "hl"), ("  ", "ctx"), (blabel, "bold"), (" → ", "dim"), (hlabel, "bold"),
+               ("    Verdict: ", "dim"), (verdict[0], verdict[1])],
+              [(" ", "ctx"), (f"✎ {counts['modified']} modified", "warn"), ("   ", "ctx"),
+               (f"✚ {counts['added']} added", "ok"), ("   ", "ctx"), (f"✗ {counts['removed']} removed", "bad"),
+               ("   ", "ctx"), (f"= {counts['unchanged']} unchanged", "dim")]]
+    roots, expand = [], set()
+    for e in entries:
+        rows = diff_rows(e["a"], e["b"]) if e["status"] != "unchanged" else diff_rows(e["b"], e["b"])
+        a, d = count_rows(rows)
+        badge, style = VERDICT_BADGE[e["status"]]
+        if e["fmt_only"]:
+            badge += " (formatting only)"
+        segs = [(badge + "  ", style), (e["sig"][:70], "bold"), (f"   {e['path']}", "dim"), (f":{e['start']}", "dim")]
+        if e["old_path"]:
+            segs.append((f"  ← moved from {e['old_path']}", "mag"))
+        if e["status"] in ("modified", "added", "removed"):
+            segs += [(f"  +{a}", "add"), (f" −{d}", "del")]
+        ref = state.range[0][0] if e["status"] == "removed" else state.range[-1][0]
+        node = mk(segs, [mk(row_segs(r)) for r in rows], state.file_url(ref, e["path"]))
+        roots.append(node)
+        if e["status"] != "unchanged" and changed <= 3:
+            expand.add(node["id"])
+    return view_tree(f"{state.repo_label} │ “{term}”", header, roots, expand)
+
+
+def compare_evolution(state):
+    term = ask_term(state, f"Scan all {len(state.range)} versions to find where it changed.")
+    if not term:
+        return "back"
+    screen(state, 4)
+    print(f"  {BOLD}Tracing{RESET} {HL} {term} {RESET}  {DIM}across {len(state.range)} versions{RESET}\n")
+    results = run_search(state, term, state.range)
+    ok = [r for r in results if not r.err]
+    skipped = [r.label for r in results if r.err]
+    if not ok or not any(r.matches for r in ok):
+        screen(state, 4)
+        notice("warn", [f"“{term}” was not found in any selected version."], title="Not found")
+        print()
+        pause()
+        return "back"
+    blocks = collect_blocks(state, ok, term)
+    groups = evolution_groups([(r.label, r.date, combined_text(b)) for r, b in zip(ok, blocks)])
+    roots, expand, change_labels = [], set(), []
+    for gi, g in enumerate(groups):
+        prev = groups[gi - 1] if gi else None
+        present = bool(g["norm"])
+        if gi == 0:
+            status = ("● present (baseline)", "cyan") if present else ("✗ not present", "bad")
+        elif not present:
+            status = ("✗ REMOVED", "bad")
+        elif not prev["norm"]:
+            status = ("✚ ADDED", "ok")
+        else:
+            status = ("✎ CHANGED", "warn")
+        if gi and status[0] != "✗ not present":
+            change_labels.append(g["labels"][0])
+        labels = g["labels"]
+        span = labels[0] if len(labels) == 1 else f"{labels[0]} → {labels[-1]}"
+        d0, d1 = g["dates"][0], g["dates"][-1]
+        dates = d0 if d0 == d1 else f"{d0} … {d1}"
+        rows = diff_rows(g["text"], g["text"]) if gi == 0 else diff_rows(prev["text"], g["text"])
+        a, d = count_rows(rows)
+        segs = [(f"{span:<26}", "bold"), (f" {dates:<24}", "dim"), (status[0], status[1])]
+        if gi:
+            segs += [(f"  +{a}", "add"), (f" −{d}", "del")]
+        segs.append((f"   {len(labels)} version(s)" if len(labels) > 1 else "", "dim"))
+        url = state.compare_url(prev["labels"][-1], labels[0]) if gi else None
+        node = mk(segs, [mk(row_segs(r)) for r in rows], url)
+        roots.append(node)
+        if gi and status[0] != "✗ not present" and len(groups) <= 6:
+            expand.add(node["id"])
+    header = [[(" ", "ctx"), (f" {term} ", "hl"), (f"   {len(ok)} version(s) checked · {len(groups)} distinct variant(s)", "dim")],
+              [(" ", "ctx"), ("changes at: ", "dim"), (", ".join(change_labels) or "none — identical in every version", "warn" if change_labels else "ok")]
+              + ([(f"    ⚠ skipped (error): {', '.join(skipped)}", "bad")] if skipped else [])]
+    return view_tree(f"{state.repo_label} │ evolution of “{term}”", header, roots, expand)
+
+
+def step_compare(state, direction):
+    state.search_fn = make_search_fn(state)
+    blabel, hlabel = compare_labels(state)
+    sub = f"· {blabel} → {hlabel}"
+    items = [
+        ("overview", f"{BOLD}📂 Release overview{RESET}  {DIM}every file added / removed / modified{RESET}"),
+        ("symbol", f"{BOLD}🔍 Symbol verdict{RESET}  {DIM}did one function / parameter / class change? (with before/after diff){RESET}"),
+        ("evolution", f"{BOLD}📈 Evolution{RESET}  {DIM}which version changed it, across all {len(state.range)} in the range{RESET}"),
+    ]
+    funcs = {"overview": compare_overview, "symbol": compare_symbol, "evolution": compare_evolution}
+    while True:
+        screen(state, 4, subtitle=sub)
+        choice = fzf_pick(items, "Compare", header=f"{blabel} → {hlabel}  ·  what do you want to know?")
+        if choice is BACK:
+            return "back"
+        try:
+            outcome = funcs[choice](state)
+        except RuntimeError as e:
+            clear_progress()
+            notice("error", [str(e)[:240]], title="Compare failed")
+            print()
+            pause()
+            continue
+        if outcome == "quit":
+            return "quit"
+
+
+def step_mode(state, direction):
+    screen(state, -1, big=True)
+    items = [
+        ("search", f"{BOLD}🔍 Search{RESET}   {DIM}where does a function / parameter / class appear, per version{RESET}"),
+        ("compare", f"{BOLD}⚖  Compare{RESET}  {DIM}what changed between two versions — files, functions, fixes{RESET}"),
+    ]
+    choice = fzf_pick(items, "Mode", header="What are we investigating?", back="quit")
+    if choice is BACK:
+        return "quit"
+    state.mode = choice
+    return "next"
+
+
+def step_final(state, direction):
+    return (step_compare if state.mode == "compare" else step_search)(state, direction)
+
+
+STEPS = [step_mode, step_platform, step_account, step_repo, step_versions, step_final]
 
 
 def main():

@@ -2,6 +2,24 @@
 
 All notable changes to sdk-sleuth are documented here.
 
+## [1.1.0] - 2026-10-05
+
+### Added
+- **Compare mode** (new top-level choice at the start): see what changed between two versions.
+  - **Release overview** — every file added / removed / modified / renamed with +/- counts, optional path
+    filter, expand a file to see its colored patch.
+  - **Symbol verdict** — type a function / parameter / class; the tool finds its definition in both versions
+    (brace/indent matching, annotations included), classifies it as ✎ modified / ✚ added / ✗ removed /
+    = unchanged (whitespace-only changes are ignored) and shows a before/after diff with word-level highlights.
+  - **Evolution** — scans every version in the range and groups identical bodies, so you see exactly which
+    release changed the symbol ("changes at: v6.17.1").
+- Works when two tags have unrelated git histories (compares file trees by blob id instead of failing).
+- Same expand/collapse viewer keys everywhere; `o` opens the GitHub/GitLab compare or file page.
+
+### Changed
+- Version pickers: **From** lists oldest → newest; **To** lists only From and newer, newest first.
+- The wizard now has 6 steps (Mode · Platform · Account · Repository · Versions · Search/Compare).
+
 ## [1.0.1] - 2026-10-05
 
 ### Added / Changed

@@ -18,6 +18,11 @@ All notable changes to sdk-sleuth are documented here.
 - Works when two tags have unrelated git histories (compares file trees by blob id instead of failing).
 - Same expand/collapse viewer keys everywhere. `o` / `y` on a **diff line** open / copy the link to that exact line in the file (added & unchanged lines → new version, removed lines → old version); on a header they open the compare page. Diff line numbers are real file line numbers.
 
+### Fixed
+- Repos with fewer than two releases (e.g. one release but more tags) now also offer their git tags, so Compare works; `v.0.0.1`-style tags sort correctly.
+- GitLab repos with neither releases nor tags offer their branches (by last commit date) instead of default-branch-only.
+- Repos that tag versions without publishing formal Releases (e.g. `appsflyer.sdk.ios` on GitLab) now list their **git tags** (with commit dates) in the version pickers instead of falling back to the default branch only.
+
 ### Changed
 - Results (search, symbol verdict, evolution, overview) now always open **fully collapsed**; expand with Enter, `1 2 3` or `e`.
 - Version pickers: **From** lists oldest → newest; **To** lists only From and newer, newest first.

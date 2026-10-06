@@ -513,7 +513,7 @@ def http_json(url, headers=None, timeout=30):
 
 
 def version_key(tag):
-    t = tag.lstrip("vV")
+    t = re.sub(r"^[vV]\.?", "", tag)
     m = re.match(r"(\d+(?:\.\d+)*)(.*)$", t)
     if not m:
         return ((0,), 1, t)
@@ -743,6 +743,63 @@ def gitlab_list_releases(project_id, token):
             break
         page = int(next_page)
     return releases
+
+
+def gitlab_list_tags(project_id, token):
+    """Plain git tags (for projects that tag versions without publishing formal Releases)."""
+    tags, page = {}, 1
+    while True:
+        data, hdrs = gitlab_api(f"projects/{project_id}/repository/tags", token, {"per_page": 100, "page": page})
+        for t in data or []:
+            c = t.get("commit") or {}
+            tags[t["name"]] = {"released_at": c.get("committed_date") or c.get("created_at")}
+        nxt = hdrs.get("x-next-page")
+        if not nxt:
+            return tags
+        page = int(nxt)
+
+
+def gh_list_tags(owner, repo, token, max_dates=200):
+    """Plain git tags, with commit dates fetched for the newest ones."""
+    names, page = [], 1
+    while True:
+        data, _ = gh_api(f"repos/{owner}/{repo}/tags", token, {"per_page": 100, "page": page})
+        if not data:
+            break
+        names.extend((t["name"], t["commit"]["sha"]) for t in data)
+        if len(data) < 100:
+            break
+        page += 1
+    out = {n: {"released_at": None} for n, _ in names}
+    newest = sorted(names, key=lambda x: version_key(x[0]), reverse=True)[:max_dates]
+
+    def date(item):
+        try:
+            d, _ = gh_api(f"repos/{owner}/{repo}/commits/{item[1]}", token)
+            return item[0], d["commit"]["committer"]["date"]
+        except RuntimeError:
+            return item[0], None
+
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for n, d in ex.map(date, newest):
+            out[n]["released_at"] = d
+    return out
+
+
+def gitlab_list_branches(project_id, token, limit=100):
+    """Newest branches, used as 'versions' for repos that have neither releases nor tags."""
+    data, _ = gitlab_api(f"projects/{project_id}/repository/branches", token, {"per_page": limit})
+    out = {}
+    for b in data or []:
+        c = b.get("commit") or {}
+        out[b["name"]] = {"released_at": c.get("committed_date") or c.get("created_at")}
+    return out
+
+
+def only_version_tags(tags):
+    """Drop junk tags (e.g. 'latest', 'build-123') when some tags look like versions."""
+    good = {k: v for k, v in tags.items() if re.match(r"^[vV]?\.?\d", k)}
+    return good or tags
 
 
 def gitlab_matches_from_item(item, term, project_path, ref):
@@ -1173,6 +1230,8 @@ class State:
         self.repo_url = None
         self.project_id = None    # GitLab only
         self.releases = None
+        self.versions_are_branches = False
+        self.vkey = version_key   # sort key for versions (by date when they are branches)
         self.range = None         # [(tag_or_None, meta_or_None)] ascending
         self.range_all = 0
         self.last_term = ""
@@ -1415,14 +1474,31 @@ def step_repo(state, direction):
 
 
 def load_releases(state):
+    """Versions for the picker: releases, topped up with plain git tags when there are fewer than two;
+    GitLab repos with neither fall back to branches (ordered by their last commit date)."""
     if state.releases is not None:
         return
-    with Spinner("Loading releases"):
+    with Spinner("Loading versions"):
         if state.platform == "GitHub":
             owner, name = state.repo.split("/", 1)
-            state.releases = gh_list_releases(owner, name, state.gh_token)
+            rel = gh_list_releases(owner, name, state.gh_token)
+            if len(rel) < 2:
+                tags = only_version_tags(gh_list_tags(owner, name, state.gh_token))
+                tags.update({k: v for k, v in rel.items() if v.get("released_at")})
+                rel = {**tags, **rel} if rel else tags
         else:
-            state.releases = gitlab_list_releases(state.project_id, state.gl_token)
+            rel = gitlab_list_releases(state.project_id, state.gl_token)
+            if len(rel) < 2:
+                tags = only_version_tags(gitlab_list_tags(state.project_id, state.gl_token))
+                rel = {**tags, **rel} if rel else tags
+            if not rel:
+                rel = gitlab_list_branches(state.project_id, state.gl_token)
+                state.versions_are_branches = bool(rel)
+        state.releases = rel
+    if state.versions_are_branches:
+        state.vkey = lambda t: (state.releases[t].get("released_at") or "", t)
+    else:
+        state.vkey = version_key
 
 
 def step_versions(state, direction):
@@ -1438,18 +1514,18 @@ def step_versions(state, direction):
         if direction == "back":
             return "back"
         if state.mode == "compare":
-            notice("warn", ["Compare needs formal releases to pick two versions from.",
-                            "This repo has none."], title="No releases")
+            notice("warn", ["Compare needs at least two versions to pick from.",
+                            "This repo has no releases and no tags."], title="No versions")
             print()
             pause()
             return "back"
-        notice("warn", ["This repo has no formal releases.", "The search will run on the default branch only."],
-               title="No releases")
+        notice("warn", ["This repo has no releases and no tags.", "The search will run on the default branch only."],
+               title="No versions")
         state.range = [(None, None)]
         time.sleep(1.2)
         return "next"
 
-    tags = sorted(state.releases.keys(), key=version_key)
+    tags = sorted(state.releases.keys(), key=state.vkey)
     newest_first = list(reversed(tags))
     default_item = (None, f"{GREEN}(default branch){RESET} {DIM}— latest code, no specific version{RESET}")
 
@@ -1464,7 +1540,7 @@ def step_versions(state, direction):
         """Only versions from `frm` upwards, newest first (default branch counts as newest)."""
         if frm is None:  # default branch has nothing newer: offer everything, newest first
             return [default_item] + [item(t) for t in newest_first]
-        newer = [t for t in newest_first if version_key(t) >= version_key(frm)]
+        newer = [t for t in newest_first if state.vkey(t) >= state.vkey(frm)]
         if state.mode == "compare":
             newer = [t for t in newer if t != frm]
         return [default_item] + [item(t) for t in newer]
@@ -1473,7 +1549,7 @@ def step_versions(state, direction):
     while True:
         if phase == "from":
             screen(state, 3)
-            frm = fzf_pick(from_items, "From", header=f"Oldest version of the range · {len(tags)} releases · oldest first\n{cols}")
+            frm = fzf_pick(from_items, "From", header=f"Oldest version of the range · {len(tags)} {'branches' if state.versions_are_branches else 'versions'} · oldest first\n{cols}")
             if frm is BACK:
                 return "back"
             phase = "to"
@@ -1496,7 +1572,7 @@ def step_versions(state, direction):
         elif to is None:
             pair = [frm, None]
         else:
-            pair = sorted([frm, to], key=version_key)
+            pair = sorted([frm, to], key=state.vkey)
         if pair[1] is None:
             state.range = [(pair[0], state.releases.get(pair[0])), (None, None)]
         else:

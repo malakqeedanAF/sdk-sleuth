@@ -106,7 +106,7 @@ What changed between two versions? Pick **Compare** on the first screen, choose 
 | View                    | Answers                                                                                                                       |
 |-------------------------|-------------------------------------------------------------------------------------------------------------------------------|
 | 📂 **Release overview** | Which files were added / removed / modified / renamed? (+/- counts, colored patches, path filter)                             |
-| 🔍 **Symbol verdict**   | Did this function / parameter / class change? Marked ✎ modified · ✚ added · ✗ removed · = unchanged, with a before/after diff |
+| 🔍 **Symbol verdict**   | Did this function / parameter / class change? Marked ✎ modified · ✚ added · ✗ removed · = unchanged, with a before/after diff **and the version(s) where it changed** (e.g. `Δ 6.17.1, 6.18.3`), each with its own diff from your From version |
 | 📈 **Evolution**        | In which release did it change? Groups identical versions across the whole range                                              |
 
 Example verdict (a real bug fix — the null-check moved inside the lambda):
@@ -138,7 +138,7 @@ Example verdict (a real bug fix — the null-check moved inside the lambda):
 │ Esc / ^B   ← back             │  │ ←            collapse / go to parent       │
 │ ← Back     last list entry    │  │ 1 2 3        expand depth (search)         │
 │ :q         quit (text prompt) │  │ e / c        expand / collapse all         │
-│ empty      ← back (text)      │  │ o            open link in browser          │
+│ empty      ← back (text)      │  │ o            open exact line in browser    │
 ╰───────────────────────────────╯  │ y            copy link                     │
                                    │ p            print plain report (search)   │
                                    │ b            ← back                        │

@@ -11,12 +11,15 @@ All notable changes to sdk-sleuth are documented here.
   - **Symbol verdict** — type a function / parameter / class; the tool finds its definition in both versions
     (brace/indent matching, annotations included), classifies it as ✎ modified / ✚ added / ✗ removed /
     = unchanged (whitespace-only changes are ignored) and shows a before/after diff with word-level highlights.
+  - Symbol verdict scans **every version in the range** and lists *where* it changed (`Δ v6.17.1, v6.18.3`);
+    each change opens a diff from your From version (`6.16.2 → 6.17.1`, `6.16.2 → 6.18.3`) and a "this step only" diff.
   - **Evolution** — scans every version in the range and groups identical bodies, so you see exactly which
     release changed the symbol ("changes at: v6.17.1").
 - Works when two tags have unrelated git histories (compares file trees by blob id instead of failing).
-- Same expand/collapse viewer keys everywhere; `o` opens the GitHub/GitLab compare or file page.
+- Same expand/collapse viewer keys everywhere. `o` / `y` on a **diff line** open / copy the link to that exact line in the file (added & unchanged lines → new version, removed lines → old version); on a header they open the compare page. Diff line numbers are real file line numbers.
 
 ### Changed
+- Results (search, symbol verdict, evolution, overview) now always open **fully collapsed**; expand with Enter, `1 2 3` or `e`.
 - Version pickers: **From** lists oldest → newest; **To** lists only From and newer, newest first.
 - The wizard now has 6 steps (Mode · Platform · Account · Repository · Versions · Search/Compare).
 

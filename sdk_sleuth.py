@@ -878,15 +878,8 @@ def apply_depth(results, depth):
 
 
 def default_depth(results):
-    total_files = sum(len(r.files) for r in results)
-    total_lines = sum(len(r.matches) for r in results)
-    if total_files <= 1:
-        return 3
-    if total_files + len(results) > 400:
-        return 1
-    if total_lines + total_files + len(results) <= 40:
-        return 3
-    return 2
+    """Results always open fully collapsed (versions only); expand with Enter / 1 2 3 / e."""
+    return 1
 
 
 def browse(state, results, term):
@@ -1891,7 +1884,8 @@ def extract_blocks(text, term, path=""):
             found.append((sl, el, li))
             last_end = el
     return [{"start": sl + 1, "end": el + 1, "sig": lines[li].strip()[:120], "kind": "def",
-             "text": textwrap.dedent("\n".join(lines[sl:el + 1]))} for sl, el, li in found]
+             "text": textwrap.dedent("\n".join(lines[sl:el + 1])),
+             "lines": list(range(sl + 1, el + 2))} for sl, el, li in found]
 
 
 def usage_block(text, term, ctx=2, max_hits=60):
@@ -1903,14 +1897,16 @@ def usage_block(text, term, ctx=2, max_hits=60):
     keep = set()
     for i in hits:
         keep.update(range(max(0, i - ctx), min(len(lines), i + ctx + 1)))
-    out, prev = [], -2
+    out, nums, prev = [], [], -2
     for i in sorted(keep):
         if prev >= 0 and i != prev + 1:
             out.append("⋯")
+            nums.append(None)
         out.append(lines[i])
+        nums.append(i + 1)
         prev = i
     return {"start": hits[0] + 1, "end": hits[-1] + 1, "sig": lines[hits[0]].strip()[:120], "kind": "usage",
-            "text": textwrap.dedent("\n".join(out))}
+            "text": textwrap.dedent("\n".join(out)), "lines": nums}
 
 
 def blocks_for_file(path, text, term):
@@ -1944,16 +1940,18 @@ def pair_blocks(a_map, b_map):
         a, b = A[ka], B[kb]
         same = norm_text(a["text"]) == norm_text(b["text"])
         entries.append({"status": "unchanged" if same else "modified", "fmt_only": same and a["text"] != b["text"],
-                        "path": kb[0], "old_path": ka[0] if ka[0] != kb[0] else None,
+                        "path": kb[0], "old_path": ka[0] if ka[0] != kb[0] else None, "ka": ka, "kb": kb, "sig_a": a["sig"],
                         "sig": b["sig"], "start": b["start"], "a": a["text"], "b": b["text"], "kind": b["kind"]})
     for ka in rest_a:
         a = A[ka]
         entries.append({"status": "removed", "fmt_only": False, "path": ka[0], "old_path": None, "sig": a["sig"],
-                        "start": a["start"], "a": a["text"], "b": "", "kind": a["kind"]})
+                        "start": a["start"], "a": a["text"], "b": "", "kind": a["kind"],
+                        "ka": ka, "kb": None, "sig_a": a["sig"]})
     for kb in rest_b:
         b = B[kb]
         entries.append({"status": "added", "fmt_only": False, "path": kb[0], "old_path": None, "sig": b["sig"],
-                        "start": b["start"], "a": "", "b": b["text"], "kind": b["kind"]})
+                        "start": b["start"], "a": "", "b": b["text"], "kind": b["kind"],
+                        "ka": None, "kb": kb, "sig_a": b["sig"]})
     order = {"modified": 0, "added": 1, "removed": 2, "unchanged": 3}
     entries.sort(key=lambda e: (order[e["status"]], e["path"], e["start"]))
     return entries
@@ -1984,10 +1982,18 @@ def intraline(a, b):
     return sa, sb
 
 
-def diff_rows(a_text, b_text, ctx=3):
-    """Line diff ignoring whitespace-only changes, with word-level highlights on changed lines."""
+def diff_rows(a_text, b_text, ctx=3, a_lines=None, b_lines=None):
+    """Line diff ignoring whitespace-only changes, with word-level highlights on changed lines.
+    a_lines / b_lines optionally map a line index to its real file line number (None = unknown)."""
     a = a_text.split("\n") if a_text else []
     b = b_text.split("\n") if b_text else []
+
+    def na(i):
+        return (a_lines[i] if i < len(a_lines) else None) if a_lines else i + 1
+
+    def nb(j):
+        return (b_lines[j] if j < len(b_lines) else None) if b_lines else j + 1
+
     sm = difflib.SequenceMatcher(None, [l.strip() for l in a], [l.strip() for l in b], autojunk=False)
     ops = sm.get_opcodes()
     rows = []
@@ -2002,11 +2008,11 @@ def diff_rows(a_text, b_text, ctx=3):
             else:
                 pre, post, gap = list(range(head)), list(range(n - tail, n)), n - head - tail
             for off in pre:
-                rows.append({"k": "eq", "a_no": i1 + off + 1, "b_no": j1 + off + 1, "text": _clean(b[j1 + off])})
+                rows.append({"k": "eq", "a_no": na(i1 + off), "b_no": nb(j1 + off), "text": _clean(b[j1 + off])})
             if gap:
                 rows.append({"k": "skip", "n": gap})
             for off in post:
-                rows.append({"k": "eq", "a_no": i1 + off + 1, "b_no": j1 + off + 1, "text": _clean(b[j1 + off])})
+                rows.append({"k": "eq", "a_no": na(i1 + off), "b_no": nb(j1 + off), "text": _clean(b[j1 + off])})
             continue
         dels, adds = a[i1:i2], b[j1:j2]
         d_segs = [None] * len(dels)
@@ -2016,9 +2022,9 @@ def diff_rows(a_text, b_text, ctx=3):
                 if difflib.SequenceMatcher(None, dels[k].strip(), adds[k].strip()).ratio() > 0.5:
                     d_segs[k], a_segs[k] = intraline(_clean(dels[k]), _clean(adds[k]))
         for k, ln in enumerate(dels):
-            rows.append({"k": "del", "a_no": i1 + k + 1, "text": _clean(ln), "segs": d_segs[k]})
+            rows.append({"k": "del", "a_no": na(i1 + k), "text": _clean(ln), "segs": d_segs[k]})
         for k, ln in enumerate(adds):
-            rows.append({"k": "add", "b_no": j1 + k + 1, "text": _clean(ln), "segs": a_segs[k]})
+            rows.append({"k": "add", "b_no": nb(j1 + k), "text": _clean(ln), "segs": a_segs[k]})
     return rows
 
 
@@ -2027,9 +2033,9 @@ def row_segs(r):
     if k == "skip":
         return [(f"      ⋯ {r['n']} unchanged line(s)", "dim")]
     if k == "eq":
-        return [(f"{r['b_no']:>5}   ", "dim"), (r["text"], "ctx")]
+        return [(f"{r['b_no'] or '':>5}   ", "dim"), (r["text"], "ctx")]
     sign, style, no = ("-", "del", r.get("a_no")) if k == "del" else ("+", "add", r.get("b_no"))
-    segs = [(f"{no:>5} ", "dim"), (f"{sign} ", style)]
+    segs = [(f"{no or '':>5} ", "dim"), (f"{sign} ", style)]
     if r.get("segs"):
         segs += [(t, style + "_hl" if ch else style) for t, ch in r["segs"]]
     else:
@@ -2055,15 +2061,20 @@ def count_rows(rows):
 
 
 def evolution_groups(items):
-    """items: [(label, date, text)] in version order -> runs of identical (whitespace-insensitive) bodies."""
+    """items: [(label, date, text[, meta])] in version order -> runs of identical (whitespace-insensitive) bodies."""
     groups = []
-    for label, date, text in items:
+    for it in items:
+        label, date, text = it[0], it[1], it[2]
+        meta = it[3] if len(it) > 3 else None
         n = norm_text(text)
         if groups and groups[-1]["norm"] == n:
-            groups[-1]["labels"].append(label)
-            groups[-1]["dates"].append(date)
+            g = groups[-1]
+            g["labels"].append(label)
+            g["dates"].append(date)
+            g["meta_last"] = meta
         else:
-            groups.append({"norm": n, "text": text, "labels": [label], "dates": [date]})
+            groups.append({"norm": n, "text": text, "labels": [label], "dates": [date],
+                           "meta_first": meta, "meta_last": meta})
     return groups
 
 
@@ -2375,7 +2386,24 @@ def compare_overview(state):
         def build():
             if not f.get("patch"):
                 return [mk([("(no textual patch — binary file or diff too large; open the link)", "dim")])]
-            return [mk(patch_segs(ln)) for ln in f["patch"].split("\n")]
+            old_no = new_no = 0
+            old_path = f.get("old_path") or f["path"]
+            out = []
+            for ln in f["patch"].split("\n"):
+                url = None
+                m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", ln)
+                if m:
+                    old_no, new_no = int(m.group(1)), int(m.group(2))
+                elif ln.startswith("-"):
+                    url = f"{state.file_url(base_ref, old_path)}#L{old_no}"
+                    old_no += 1
+                elif ln.startswith("+") or ln.startswith(" "):
+                    url = f"{state.file_url(head_ref, f['path'])}#L{new_no}"
+                    new_no += 1
+                    if ln.startswith(" "):
+                        old_no += 1
+                out.append(mk(patch_segs(ln), url=url))
+            return out
         return build
 
     roots = []
@@ -2432,55 +2460,142 @@ def ask_term(state, hint):
     return term
 
 
+def entry_block_at(entry, bmap):
+    """(path, block) of this symbol in one version (bmap: path -> blocks), or (None, None) if absent."""
+    for k in (entry.get("kb"), entry.get("ka")):
+        if k and k[0] in bmap and k[1] < len(bmap[k[0]]):
+            return k[0], bmap[k[0]][k[1]]
+    sigs = {entry["sig"], entry.get("sig_a")}
+    for path, bl in bmap.items():  # moved to another file
+        for blk in bl:
+            if blk["sig"] in sigs:
+                return path, blk
+    return None, None
+
+
+def change_points(entry, ok, blocks):
+    """Versions (in range order) where this symbol's body differs from the previous version."""
+    series = []
+    for i, r in enumerate(ok):
+        path, blk = entry_block_at(entry, blocks[i])
+        series.append((r.label, r.date, blk["text"] if blk else "",
+                       (r.tag, path, blk["lines"]) if blk else None))
+    groups = evolution_groups(series)
+    cps = []
+    for gi in range(1, len(groups)):
+        prev, g = groups[gi - 1], groups[gi]
+        status = "added" if (g["norm"] and not prev["norm"]) else "removed" if (prev["norm"] and not g["norm"]) else "modified"
+        cps.append({"label": g["labels"][0], "date": g["dates"][0], "status": status,
+                    "prev_text": prev["text"], "text": g["text"], "prev_label": prev["labels"][-1],
+                    "meta": g["meta_first"], "prev_meta": prev["meta_last"]})
+    return groups[0], cps
+
+
+def diff_children(state, a_text, b_text, a_meta=None, b_meta=None, ctx=3):
+    """Diff rows as tree nodes. Each row links to its exact line on GitHub / GitLab.
+    meta = (ref, path, line_numbers) of the before / after text."""
+    rows = diff_rows(a_text, b_text, ctx, a_meta[2] if a_meta else None, b_meta[2] if b_meta else None)
+    nodes = []
+    for r in rows:
+        url = None
+        if r["k"] in ("eq", "add") and b_meta and r.get("b_no") and b_meta[1]:
+            url = f"{state.file_url(b_meta[0], b_meta[1])}#L{r['b_no']}"
+        elif r["k"] == "del" and a_meta and r.get("a_no") and a_meta[1]:
+            url = f"{state.file_url(a_meta[0], a_meta[1])}#L{r['a_no']}"
+        nodes.append(mk(row_segs(r), url=url))
+    return nodes, count_rows(rows)
+
+
+def diff_node(state, segs, a_text, b_text, url=None, a_meta=None, b_meta=None):
+    kids, (ad, de) = diff_children(state, a_text, b_text, a_meta, b_meta)
+    return mk(segs + [(f"  +{ad}", "add"), (f" −{de}", "del")], kids, url)
+
+
 def compare_symbol(state):
-    term = ask_term(state, "Did this symbol change between the two versions?")
+    term = ask_term(state, f"Scans all {len(state.range)} versions in the range and tells you where it changed.")
     if not term:
         return "back"
     blabel, hlabel = compare_labels(state)
     screen(state, 4)
-    print(f"  {BOLD}Investigating{RESET} {HL} {term} {RESET}  {DIM}{blabel} → {hlabel}{RESET}\n")
-    results = run_search(state, term, [state.range[0], state.range[-1]])
-    errs = [r for r in results if r.err]
-    if errs:
-        notice("error", [f"{r.label}: {r.err[:160]}" for r in errs], title="Search failed")
+    print(f"  {BOLD}Investigating{RESET} {HL} {term} {RESET}  {DIM}{blabel} → {hlabel} ({len(state.range)} versions){RESET}\n")
+    results = run_search(state, term, state.range)
+    ok = [r for r in results if not r.err]
+    if len(ok) < 2 or results[0].err or results[-1].err:
+        bad = [r for r in results if r.err]
+        notice("error", [f"{r.label}: {r.err[:160]}" for r in bad] or ["Not enough versions to compare."], title="Search failed")
         print()
         pause()
         return "back"
-    if not any(r.matches for r in results):
+    if not any(r.matches for r in ok):
         screen(state, 4)
-        notice("warn", [f"“{term}” does not appear in {blabel} or {hlabel}.",
+        notice("warn", [f"“{term}” does not appear in any version from {blabel} to {hlabel}.",
                         f"{ITALIC}The case went cold.{RESET}"], title="Not found")
         print()
         pause()
         return "back"
-    blocks = collect_blocks(state, results, term)
-    entries = pair_blocks(blocks[0], blocks[1])
+    blocks = collect_blocks(state, ok, term)
+    entries = pair_blocks(blocks[0], blocks[-1])
     counts = {k: sum(1 for e in entries if e["status"] == k) for k in VERDICT_BADGE}
     changed = counts["modified"] + counts["added"] + counts["removed"]
     verdict = ("CHANGED", "warn") if changed else ("UNCHANGED", "ok")
-    header = [[(" ", "ctx"), (f" {term} ", "hl"), ("  ", "ctx"), (blabel, "bold"), (" → ", "dim"), (hlabel, "bold"),
-               ("    Verdict: ", "dim"), (verdict[0], verdict[1])],
-              [(" ", "ctx"), (f"✎ {counts['modified']} modified", "warn"), ("   ", "ctx"),
-               (f"✚ {counts['added']} added", "ok"), ("   ", "ctx"), (f"✗ {counts['removed']} removed", "bad"),
-               ("   ", "ctx"), (f"= {counts['unchanged']} unchanged", "dim")]]
-    roots, expand = [], set()
+    base_label, head_label = ok[0].label, ok[-1].label
+    tags = {r.label: r.tag for r in ok}
+    roots, all_cps = [], []
     for e in entries:
-        rows = diff_rows(e["a"], e["b"]) if e["status"] != "unchanged" else diff_rows(e["b"], e["b"])
-        a, d = count_rows(rows)
+        base_group, cps = change_points(e, ok, blocks)
+        cp_labels = [c["label"] for c in cps]
+        for c in cp_labels:
+            if c not in all_cps:
+                all_cps.append(c)
         badge, style = VERDICT_BADGE[e["status"]]
         if e["fmt_only"]:
             badge += " (formatting only)"
-        segs = [(badge + "  ", style), (e["sig"][:70], "bold"), (f"   {e['path']}", "dim"), (f":{e['start']}", "dim")]
+        segs = [(badge + "  ", style), (e["sig"][:60], "bold"), (f"   {e['path']}", "dim"), (f":{e['start']}", "dim")]
         if e["old_path"]:
             segs.append((f"  ← moved from {e['old_path']}", "mag"))
-        if e["status"] in ("modified", "added", "removed"):
-            segs += [(f"  +{a}", "add"), (f" −{d}", "del")]
-        ref = state.range[0][0] if e["status"] == "removed" else state.range[-1][0]
-        node = mk(segs, [mk(row_segs(r)) for r in rows], state.file_url(ref, e["path"]))
-        roots.append(node)
-        if e["status"] != "unchanged" and changed <= 3:
-            expand.add(node["id"])
-    return view_tree(f"{state.repo_label} │ “{term}”", header, roots, expand)
+        if cps and e["status"] != "unchanged":
+            shown = ", ".join(cp_labels[:4]) + (f" +{len(cp_labels) - 4}" if len(cp_labels) > 4 else "")
+            segs.append((f"   Δ {shown}", "warn"))
+        pa, ba = entry_block_at(e, blocks[0])
+        pb, bb = entry_block_at(e, blocks[-1])
+        a_meta = (ok[0].tag, pa, ba["lines"]) if ba else None
+        b_meta = (ok[-1].tag, pb, bb["lines"]) if bb else None
+        ref_tag, ref_path = (ok[0].tag, pa) if e["status"] == "removed" else (ok[-1].tag, pb or e["path"])
+        url = state.file_url(ref_tag, ref_path or e["path"])
+        kids = []
+        if e["status"] == "unchanged":
+            kids, _ = diff_children(state, e["b"], e["b"], b_meta, b_meta)
+        else:
+            if len(cps) >= 2:
+                kids.append(diff_node(state, [("Σ whole range   ", "cyan"), (f"{base_label} → {head_label}", "bold")],
+                                      e["a"], e["b"], state.compare_url(tags[base_label], tags[head_label]),
+                                      a_meta, b_meta))
+            for ci, c in enumerate(cps):
+                icon, st = {"added": ("✚", "ok"), "removed": ("✗", "bad"), "modified": ("✎", "warn")}[c["status"]]
+                head = [(f"{icon} {c['label']:<14}", st), (f" {c['date']}   ", "dim")]
+                cum_url = state.compare_url(tags[base_label], tags[c["label"]])
+                cum = diff_node(state, head + [(f"{base_label} → {c['label']}", "bold")],
+                                base_group["text"], c["text"], cum_url, base_group["meta_first"], c["meta"])
+                if ci == 0:
+                    kids.append(cum)  # the first change: since-the-start == this step
+                    continue
+                since = diff_node(state, [("since the start   ", "dim"), (f"{base_label} → {c['label']}", "bold")],
+                                  base_group["text"], c["text"], cum_url, base_group["meta_first"], c["meta"])
+                step = diff_node(state, [("this step only   ", "dim"), (f"{c['prev_label']} → {c['label']}", "bold")],
+                                 c["prev_text"], c["text"],
+                                 state.compare_url(tags[c["prev_label"]], tags[c["label"]]), c["prev_meta"], c["meta"])
+                kids.append(mk(cum["segs"], [since, step], cum_url))
+        roots.append(mk(segs, kids, url))
+    skipped = [r.label for r in results if r.err]
+    header = [[(" ", "ctx"), (f" {term} ", "hl"), ("  ", "ctx"), (blabel, "bold"), (" → ", "dim"), (hlabel, "bold"),
+               (f"   {len(ok)} versions scanned", "dim"), ("    Verdict: ", "dim"), (verdict[0], verdict[1])],
+              [(" ", "ctx"), (f"✎ {counts['modified']} modified", "warn"), ("   ", "ctx"),
+               (f"✚ {counts['added']} added", "ok"), ("   ", "ctx"), (f"✗ {counts['removed']} removed", "bad"),
+               ("   ", "ctx"), (f"= {counts['unchanged']} unchanged", "dim")],
+              [(" ", "ctx"), ("changed in: ", "dim"),
+               (", ".join(all_cps) or "no version in the range", "warn" if all_cps else "ok")]
+              + ([(f"    ⚠ skipped (error): {', '.join(skipped)}", "bad")] if skipped else [])]
+    return view_tree(f"{state.repo_label} │ “{term}”", header, roots)
 
 
 def compare_evolution(state):
@@ -2527,8 +2642,6 @@ def compare_evolution(state):
         url = state.compare_url(prev["labels"][-1], labels[0]) if gi else None
         node = mk(segs, [mk(row_segs(r)) for r in rows], url)
         roots.append(node)
-        if gi and status[0] != "✗ not present" and len(groups) <= 6:
-            expand.add(node["id"])
     header = [[(" ", "ctx"), (f" {term} ", "hl"), (f"   {len(ok)} version(s) checked · {len(groups)} distinct variant(s)", "dim")],
               [(" ", "ctx"), ("changes at: ", "dim"), (", ".join(change_labels) or "none — identical in every version", "warn" if change_labels else "ok")]
               + ([(f"    ⚠ skipped (error): {', '.join(skipped)}", "bad")] if skipped else [])]

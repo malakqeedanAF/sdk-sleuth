@@ -138,10 +138,11 @@ Example verdict (a real bug fix — the null-check moved inside the lambda):
 │ Esc / ^B   ← back             │  │ ←            collapse / go to parent       │
 │ ← Back     last list entry    │  │ 1 2 3        expand depth (search)         │
 │ :q         quit (text prompt) │  │ e / c        expand / collapse all         │
-│ empty      ← back (text)      │  │ o            open exact line in browser    │
-╰───────────────────────────────╯  │ y            copy link                     │
-                                   │ p            print plain report (search)   │
-                                   │ b            ← back                        │
+│ empty      ← back (text)      │  │ o            open the code (exact line)    │
+│ ⏎ on ▸ 6.x open/close a group │  │ d            open the diff (same change)   │
+│ typing     searches all       │  │ y / Y        copy code / diff link         │
+│            versions, too      │  │ p            print plain report (search)   │
+╰───────────────────────────────╯  │ b            ← back                        │
                                    │ q            quit                          │
                                    ╰────────────────────────────────────────────╯
 ```

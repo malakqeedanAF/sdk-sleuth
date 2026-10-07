@@ -36,7 +36,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib import error, parse, request
 
-VERSION = "1.1.0"
+VERSION = "1.1.2"
 
 # ---------- colors ----------
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
@@ -1418,7 +1418,7 @@ class State:
         base, head = base or self.default_branch or "HEAD", head or self.default_branch or "HEAD"
         if self.platform == "GitHub":
             return f"https://github.com/{self.repo}/compare/{parse.quote(base, safe='')}...{parse.quote(head, safe='')}"
-        return f"{gitlab_base()}/{self.repo}/-/compare/{parse.quote(base, safe='')}...{parse.quote(head, safe='')}"
+        return f"{gitlab_base()}/{self.repo}/-/compare/{parse.quote(base, safe='')}...{parse.quote(head, safe='')}?straight=true"
 
     def range_summary(self):
         if not self.range:
@@ -2350,8 +2350,26 @@ def combined_text(bmap):
 _NID = itertools.count(1)
 
 
-def mk(segs, children=None, url=None):
-    return {"id": next(_NID), "segs": segs, "children": children, "url": url}
+def mk(segs, children=None, url=None, curl=None):
+    """url = the code (file/line at one version) · curl = the comparison page (both inherited by child rows)."""
+    return {"id": next(_NID), "segs": segs, "children": children, "url": url, "curl": curl}
+
+
+def diff_anchor(state, curl, path, old_no=None, new_no=None, side="new"):
+    """Deep-link into a comparison page: scrolls to `path`'s diff, and to the line when the numbers are known."""
+    if not curl or not path:
+        return curl
+    base = curl.split("#")[0]
+    if state.platform == "GitHub":
+        a = base + "#diff-" + hashlib.sha256(path.encode()).hexdigest()
+        if side == "old" and old_no:
+            return a + f"L{old_no}"
+        return a + f"R{new_no}" if new_no else a
+    h = hashlib.sha1(path.encode()).hexdigest()
+    base = curl.split("#")[0]
+    if old_no and new_no:
+        return f"{base}#{h}_{old_no}_{new_no}"
+    return f"{base}#{h}"
 
 
 def _kids(n):
@@ -2365,15 +2383,17 @@ def _kids(n):
     return ch
 
 
-def _flatten(nodes, expanded, level=0, url=None, out=None):
+def _flatten(nodes, expanded, level=0, url=None, out=None, curl=None):
     out = [] if out is None else out
     for n in nodes:
         u = n.get("url") or url
+        cu = n.get("curl") or curl
+        n["_curl"] = cu
         out.append((level, n, u))
         if n["id"] in expanded:
             kids = _kids(n)
             if kids:
-                _flatten(kids, expanded, level + 1, u, out)
+                _flatten(kids, expanded, level + 1, u, out, cu)
     return out
 
 
@@ -2516,8 +2536,8 @@ def _view_tree(scr, title, header, roots, expanded):
             x = put(h - 2, 0, " ↗ ", S["cyan"])
             put(h - 2, x, url, S["url"])
         x = 0
-        for k, d in [("↑↓", "move"), ("⏎/→/←", "expand/collapse"), ("e/c", "all"), ("o", "open"),
-                     ("y", "copy link"), ("b", "← back"), ("q", "quit")]:
+        for k, d in [("↑↓", "move"), ("⏎/→/←", "expand/collapse"), ("e/c", "all"), ("o", "open code"),
+                     ("d", "open diff"), ("y/Y", "copy code/diff link"), ("b", "← back"), ("q", "quit")]:
             x = put(h - 1, x, f" {k}", S["cyan"])
             x = put(h - 1, x, f" {d} ", S["dim"])
         scr.refresh()
@@ -2580,15 +2600,22 @@ def _view_tree(scr, title, header, roots, expanded):
             expanded.clear()
             rebuild()
             sel = 0
-        elif ch == ord("o") and url:
-            webbrowser.open(url)
-            flash = ("Opened in browser", time.time())
-        elif ch == ord("y") and url:
-            try:
-                subprocess.run(["pbcopy"], input=url, text=True, check=True)
-                flash = ("Copied link to clipboard", time.time())
-            except Exception:
-                flash = ("Clipboard unavailable", time.time())
+        elif ch in (ord("o"), ord("d"), ord("y"), ord("Y")):
+            cmp_link = node.get("_curl")
+            want_diff = ch in (ord("d"), ord("Y"))
+            link = cmp_link if want_diff else (url or cmp_link)   # o / y: the code; d / Y: the comparison
+            if not link:
+                flash = ("No link for this row", time.time())
+            elif ch in (ord("o"), ord("d")):
+                webbrowser.open(link)
+                flash = ("Opened the comparison in your browser" if link == cmp_link else "Opened the code in your browser",
+                         time.time())
+            else:
+                try:
+                    subprocess.run(["pbcopy"], input=link, text=True, check=True)
+                    flash = ("Copied the comparison link" if link == cmp_link else "Copied the code link", time.time())
+                except Exception:
+                    flash = ("Clipboard unavailable", time.time())
         elif ch in (ord("b"), 27, curses.KEY_BACKSPACE, 127, 8):
             return "back"
         elif ch in (ord("q"), ord("Q")):
@@ -2603,7 +2630,7 @@ VERDICT_BADGE = {"modified": ("✎ MODIFIED", "warn"), "added": ("✚ ADDED", "o
 
 def compare_labels(state):
     base, head = state.range[0], state.range[-1]
-    return (base[0] or "default branch"), (head[0] or "default branch")
+    return (vlabel(base[0]) or "default branch"), (vlabel(head[0]) or "default branch")
 
 
 def compare_overview(state):
@@ -2641,6 +2668,8 @@ def compare_overview(state):
                (f"R {counts['renamed']} renamed", "mag")]
               + ([(f"    {note}", "warn")] if note else [])]
 
+    cmp_page = state.compare_url(base_ref, head_ref)
+
     def patch_children(f):
         def build():
             if not f.get("patch"):
@@ -2649,19 +2678,21 @@ def compare_overview(state):
             old_path = f.get("old_path") or f["path"]
             out = []
             for ln in f["patch"].split("\n"):
-                url = None
+                url = cu = None
                 m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", ln)
                 if m:
                     old_no, new_no = int(m.group(1)), int(m.group(2))
                 elif ln.startswith("-"):
                     url = f"{state.file_url(base_ref, old_path)}#L{old_no}"
+                    cu = diff_anchor(state, cmp_page, old_path, old_no, new_no, "old")
                     old_no += 1
                 elif ln.startswith("+") or ln.startswith(" "):
                     url = f"{state.file_url(head_ref, f['path'])}#L{new_no}"
+                    cu = diff_anchor(state, cmp_page, f["path"], old_no, new_no, "new")
                     new_no += 1
                     if ln.startswith(" "):
                         old_no += 1
-                out.append(mk(patch_segs(ln), url=url))
+                out.append(mk(patch_segs(ln), url=url, curl=cu))
             return out
         return build
 
@@ -2674,7 +2705,8 @@ def compare_overview(state):
         if f["status"] == "renamed" and f.get("old_path"):
             segs.append((f"  ← {f['old_path']}", "dim"))
         ref = head_ref if f["status"] != "removed" else base_ref
-        roots.append(mk(segs, patch_children(f), state.file_url(ref, f["path"])))
+        roots.append(mk(segs, patch_children(f), state.file_url(ref, f["path"]),
+                        diff_anchor(state, cmp_page, f["path"])))
     return view_tree(f"{state.repo_label} │ compare", header, roots)
 
 
@@ -2750,24 +2782,35 @@ def change_points(entry, ok, blocks):
     return groups[0], cps
 
 
-def diff_children(state, a_text, b_text, a_meta=None, b_meta=None, ctx=3):
-    """Diff rows as tree nodes. Each row links to its exact line on GitHub / GitLab.
-    meta = (ref, path, line_numbers) of the before / after text."""
+def diff_children(state, a_text, b_text, a_meta=None, b_meta=None, ctx=3, curl=None):
+    """Diff rows as tree nodes. Each row links to its exact line (url) and, when `curl` is the comparison page,
+    to the same change inside that comparison (curl). meta = (ref, path, line_numbers) of the before / after text."""
     rows = diff_rows(a_text, b_text, ctx, a_meta[2] if a_meta else None, b_meta[2] if b_meta else None)
-    nodes = []
+    nodes, last_a, last_b = [], 0, 0
     for r in rows:
-        url = None
-        if r["k"] in ("eq", "add") and b_meta and r.get("b_no") and b_meta[1]:
-            url = f"{state.file_url(b_meta[0], b_meta[1])}#L{r['b_no']}"
-        elif r["k"] == "del" and a_meta and r.get("a_no") and a_meta[1]:
-            url = f"{state.file_url(a_meta[0], a_meta[1])}#L{r['a_no']}"
-        nodes.append(mk(row_segs(r), url=url))
+        url = cu = None
+        a_no, b_no = r.get("a_no"), r.get("b_no")
+        path = (b_meta[1] if b_meta else None) or (a_meta[1] if a_meta else None)
+        if r["k"] in ("eq", "add") and b_meta and b_no and b_meta[1]:
+            url = f"{state.file_url(b_meta[0], b_meta[1])}#L{b_no}"
+        elif r["k"] == "del" and a_meta and a_no and a_meta[1]:
+            url = f"{state.file_url(a_meta[0], a_meta[1])}#L{a_no}"
+        if curl and path:
+            if r["k"] == "del" and a_no:
+                cu = diff_anchor(state, curl, a_meta[1] if a_meta else path, a_no, last_b + 1, "old")
+            elif b_no:
+                cu = diff_anchor(state, curl, path, (a_no or last_a + 1), b_no, "new")
+        last_a, last_b = a_no or last_a, b_no or last_b
+        nodes.append(mk(row_segs(r), url=url, curl=cu))
     return nodes, count_rows(rows)
 
 
 def diff_node(state, segs, a_text, b_text, url=None, a_meta=None, b_meta=None):
-    kids, (ad, de) = diff_children(state, a_text, b_text, a_meta, b_meta)
-    return mk(segs + [(f"  +{ad}", "add"), (f" −{de}", "del")], kids, url)
+    """url = the comparison page for this diff; the node's own code link is the file at the newer version."""
+    kids, (ad, de) = diff_children(state, a_text, b_text, a_meta, b_meta, curl=url)
+    meta = b_meta or a_meta
+    code = state.file_url(meta[0], meta[1]) if meta and meta[1] else None
+    return mk(segs + [(f"  +{ad}", "add"), (f" −{de}", "del")], kids, code, url)
 
 
 def compare_symbol(state):
@@ -2843,8 +2886,8 @@ def compare_symbol(state):
                 step = diff_node(state, [("this step only   ", "dim"), (f"{c['prev_label']} → {c['label']}", "bold")],
                                  c["prev_text"], c["text"],
                                  state.compare_url(tags[c["prev_label"]], tags[c["label"]]), c["prev_meta"], c["meta"])
-                kids.append(mk(cum["segs"], [since, step], cum_url))
-        roots.append(mk(segs, kids, url))
+                kids.append(mk(cum["segs"], [since, step], cum["url"], cum_url))
+        roots.append(mk(segs, kids, url, state.compare_url(ok[0].tag, ok[-1].tag) if e["status"] != "unchanged" else None))
     skipped = [r.label for r in results if r.err]
     header = [[(" ", "ctx"), (f" {term} ", "hl"), ("  ", "ctx"), (blabel, "bold"), (" → ", "dim"), (hlabel, "bold"),
                (f"   {len(ok)} versions scanned", "dim"), ("    Verdict: ", "dim"), (verdict[0], verdict[1])],
@@ -2873,7 +2916,15 @@ def compare_evolution(state):
         pause()
         return "back"
     blocks = collect_blocks(state, ok, term)
-    groups = evolution_groups([(r.label, r.date, combined_text(b)) for r, b in zip(ok, blocks)])
+    groups = evolution_groups([(r.label, r.date, combined_text(b), r.tag) for r, b in zip(ok, blocks)])
+    blocks_by_ref = {r.tag: b for r, b in zip(ok, blocks)}
+
+    def group_code_url(state, ref, bmap):
+        """The code at that version: the first file/line holding the symbol (or the version's tree)."""
+        for path in sorted(bmap):
+            first = bmap[path][0]
+            return f"{state.file_url(ref, path)}#L{first.get('start') or 1}"
+        return None
     roots, expand, change_labels = [], set(), []
     for gi, g in enumerate(groups):
         prev = groups[gi - 1] if gi else None
@@ -2897,11 +2948,26 @@ def compare_evolution(state):
         segs = [(f"{span:<26}", "bold"), (f" {dates:<24}", "dim"), (status[0], status[1])]
         if gi:
             segs += [(f"  +{a}", "add"), (f" −{d}", "del")]
-        segs.append((f"   {len(labels)} version(s)" if len(labels) > 1 else "", "dim"))
-        url = state.compare_url(prev["labels"][-1], labels[0]) if gi else None
-        node = mk(segs, [mk(row_segs(r)) for r in rows], url)
+        segs.append((f"   identical in {len(labels)} versions" if len(labels) > 1 else "", "dim"))
+        # URLs need the real git refs (e.g. releases/6.x.x/6.16.x/6.16.0-rc1), not the short display labels
+        curl = state.compare_url(prev["meta_last"], g["meta_first"]) if gi else None
+        cur_map = blocks_by_ref.get(g["meta_first"], {})
+        code = group_code_url(state, g["meta_first"], cur_map)
+        if gi:
+            # scroll the comparison to the first file whose symbol actually changed (and to its line)
+            prev_map = blocks_by_ref.get(prev["meta_last"], {})
+            for path in sorted(set(prev_map) | set(cur_map)):
+                old_b, new_b = prev_map.get(path), cur_map.get(path)
+                if norm_text("\n".join(b["text"] for b in old_b or [])) != norm_text("\n".join(b["text"] for b in new_b or [])):
+                    curl = diff_anchor(state, curl, path, old_b[0]["start"] if old_b else None,
+                                       new_b[0]["start"] if new_b else None, "new" if new_b else "old")
+                    if new_b:
+                        code = f"{state.file_url(g['meta_first'], path)}#L{new_b[0]['start']}"
+                    break
+        node = mk(segs, [mk(row_segs(r)) for r in rows], code, curl)
         roots.append(node)
     header = [[(" ", "ctx"), (f" {term} ", "hl"), (f"   {len(ok)} version(s) checked · {len(groups)} distinct variant(s)", "dim")],
+              [(" ", "ctx"), ("each row = consecutive versions whose code is identical (first → last) · +/− is vs the row above", "dim")],
               [(" ", "ctx"), ("changes at: ", "dim"), (", ".join(change_labels) or "none — identical in every version", "warn" if change_labels else "ok")]
               + ([(f"    ⚠ skipped (error): {', '.join(skipped)}", "bad")] if skipped else [])]
     return view_tree(f"{state.repo_label} │ evolution of “{term}”", header, roots, expand)

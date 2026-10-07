@@ -2,6 +2,17 @@
 
 All notable changes to sdk-sleuth are documented here.
 
+## [1.1.2] - 2026-10-07
+
+### Added
+- **`o` opens the code, `d` opens the comparison.** `o` goes to the file at the exact line (at that version); `d` opens the GitHub/GitLab compare page scrolled to the same file and line. `y` / `Y` copy the code / diff link. Works in Release overview, Symbol verdict and Evolution.
+- Evolution header explains how to read the rows (first → last version with identical code, +/− vs the row above).
+
+### Fixed
+- Evolution links used the short version name (`6.16.0-rc1`) instead of the real ref (`releases/6.x.x/6.16.x/6.16.0-rc1`), opening the wrong GitLab revision.
+- Evolution `d` now scrolls to the first changed file and line (it opened the compare page without an anchor).
+- GitLab compare links use `?straight=true`, so branches are diffed directly instead of showing "There isn't anything to compare".
+
 ## [1.1.0] - 2026-10-05
 
 ### Added

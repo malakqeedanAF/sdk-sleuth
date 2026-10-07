@@ -79,7 +79,7 @@ Find every place a symbol appears, version by version.
 2. **Platform** — GitHub or GitLab.
 3. **Account** — a `gh` account (GitHub) or token check (GitLab).
 4. **Repo** — favorites, browse an org / owner, or paste a URL.
-5. **Versions** — pick *From* (oldest → newest list) and *To* (only From and newer, newest first). Each version shows its release date `yyyy/mm/dd`.
+5. **Versions** — pick *From* (oldest → newest list) and *To* (only From and newer, newest first). Majors (4.x, 5.x, 6.x, 7.x …) are collapsed groups — press ⏎ on one to open it. Names are short (`6.18.0_rc4`) and only the latest rc per version is listed. Each version shows its release date `yyyy/mm/dd`.
 6. **Search** — type a term. Results open in an expandable browser:
 
 ```

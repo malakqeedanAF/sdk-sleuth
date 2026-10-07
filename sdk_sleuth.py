@@ -24,6 +24,7 @@ import locale
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -84,6 +85,21 @@ FAVORITES_GITLAB = [
     "incoming/one/af-multindex",
     "mobile/security-sdk/af-security-sdk",
 ]
+
+# Hide versions older than a major version for these GitLab projects (older SDKs are deprecated; a shorter
+# list is faster to browse and to scan). Set a value to None / remove the entry to show every version.
+# The environment variable SDK_SLEUTH_ALL_VERSIONS=1 turns the filter off without editing the code.
+GITLAB_MIN_MAJOR = {
+    "mobile/ios/appsflyer.sdk.ios": 6,
+    "mobile/appsflyer-android-sdk": 6,
+}
+
+# For these GitLab projects the versions come ONLY from the `releases/<major>.x.x/<minor>.x/<version>` branches
+# (no formal Releases, no tags); each version shows only its highest rc.
+GITLAB_BRANCHES_ONLY = {
+    "mobile/ios/appsflyer.sdk.ios",
+    "mobile/appsflyer-android-sdk",
+}
 
 FAVORITES_GITHUB = [
     "AppsFlyerSDK/appsflyer-react-native-plugin",
@@ -453,7 +469,38 @@ def ask_line(prompt, prefill=""):
             readline.set_startup_hook()
 
 
-def fzf_pick(items, prompt, header="", back="back", query=""):
+PICKER_HELPER = r"""
+import json, shlex, sys
+path, cmd = sys.argv[1], sys.argv[2]
+q = (sys.argv[3] if cmd == "list" else sys.argv[4]).strip() if len(sys.argv) > 3 else ""
+st = json.load(open(path))
+rows, opened = st["rows"], set(st["open"])
+
+def shown(r, q):
+    if q:
+        return r["k"] == "v"
+    return r["k"] in ("a", "g") or (r["k"] == "v" and r["m"] in opened)
+
+def text(r):
+    return r["o"] if r["k"] == "g" and r["m"] in opened and r["o"] else r["c"]
+
+if cmd == "list":
+    print("\n".join(f"{r['i']}\t{text(r)}" for r in rows if shown(r, q)))
+else:
+    idx = int(sys.argv[3])
+    row = next((r for r in rows if r["i"] == idx), None)
+    if row and row["k"] == "g" and not q:
+        opened ^= {row["m"]}
+        st["open"] = sorted(opened)
+        json.dump(st, open(path, "w"))
+        pos = sum(1 for r in rows[:rows.index(row)] if shown(r, ""))
+        print("reload-sync[%s]+pos(%d)" % (" ".join([shlex.quote(sys.executable), shlex.quote(sys.argv[0]), shlex.quote(sys.argv[1]), "list", "''"]), pos + 1))
+    else:
+        print("accept")
+"""
+
+
+def fzf_pick(items, prompt, header="", back="back", query="", start=None, kinds=None, open_majors=None):
     """items: list of str or (value, display). Returns the value, or BACK.
 
     back: "back" adds a '← Back' entry, "quit" adds '✕ Quit', None adds neither.
@@ -467,10 +514,26 @@ def fzf_pick(items, prompt, header="", back="back", query=""):
     if back:
         label = "✕ Quit" if back == "quit" else "← Back"
         entries.append(f"-1\t{YELLOW}{label}{RESET}")
+    state_file = helper_file = None
+    if kinds:
+        # kinds[i] = (kind, major, open_text): "a" always shown · "g" collapsible group header (open_text = its ▾ form)
+        # · "v" version of that major. Expand/collapse and "type to search every version" run inside ONE fzf
+        # session (helper script + reload), so toggling a group never redraws or restarts the picker.
+        import tempfile
+        kinds = list(kinds) + ([("a", None, None)] if back else [])
+        rows = [{"i": int(e.split("\t", 1)[0]), "k": k, "m": m, "c": e.split("\t", 1)[1], "o": o}
+                for (k, m, o), e in zip(kinds, entries)]
+        fd_, state_file = tempfile.mkstemp(prefix="sdk-sleuth-", suffix=".json")
+        with os.fdopen(fd_, "w") as fh:
+            json.dump({"rows": rows, "open": sorted(open_majors or [])}, fh)
+        fd_, helper_file = tempfile.mkstemp(prefix="sdk-sleuth-", suffix=".py")
+        with os.fdopen(fd_, "w") as fh:
+            fh.write(PICKER_HELPER)
+        entries = None  # fzf is fed by the helper
     hint = {"back": "esc / ctrl-b: ← back", "quit": "esc: ✕ quit"}.get(back, "")
     head = "\n".join(x for x in (header, hint) if x)
-    _, rows = term_size()
-    height = max(8, rows - UI_USED - 2)
+    _, rows_ = term_size()
+    height = max(8, rows_ - UI_USED - 2)
     args = [
         "fzf", f"--prompt={prompt} ❯ ", f"--height={height}", "--layout=reverse",
         "--border=rounded", "--pointer=▶", "--marker=✓", "--info=inline-right",
@@ -482,7 +545,21 @@ def fzf_pick(items, prompt, header="", back="back", query=""):
         args.append(f"--header={head}")
     if query:
         args.append(f"--query={query}")
+    if start:
+        args.append(f"--bind=start:pos({start + 1})")
+    if state_file:
+        base = f"{shlex.quote(sys.executable)} {shlex.quote(helper_file)} {shlex.quote(state_file)}"
+        args.append(f"--bind=change:reload-sync[{base} list {{q}}]")
+        args.append(f"--bind=enter:transform[{base} enter {{1}} {{q}}]")
+        args.append("--exact")
+        entries = subprocess.run(f"{base} list ''", shell=True, capture_output=True, text=True).stdout.split("\n")
     proc = subprocess.run(args, input="\n".join(entries), capture_output=True, text=True)
+    for f in (state_file, helper_file):
+        if f:
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
     if proc.returncode == 2:
         die(f"fzf failed: {proc.stderr.strip()}")
     lines = proc.stdout.split("\n")
@@ -513,7 +590,7 @@ def http_json(url, headers=None, timeout=30):
 
 
 def version_key(tag):
-    t = re.sub(r"^[vV]\.?", "", tag)
+    t = re.sub(r"^[vV]\.?", "", tag.rsplit("/", 1)[-1])  # 'releases/6.x.x/6.17.x/6.17.5' -> '6.17.5'
     m = re.match(r"(\d+(?:\.\d+)*)(.*)$", t)
     if not m:
         return ((0,), 1, t)
@@ -521,7 +598,34 @@ def version_key(tag):
     suffix = m.group(2)
     # a clean release (no "-rc1"/"-beta" suffix) sorts after its pre-releases
     suffix_rank = 1 if suffix == "" else 0
-    return (nums, suffix_rank, suffix)
+    natural = tuple(int(x) if x.isdigit() else x for x in re.split(r"(\d+)", suffix))  # _rc2 < _rc10
+    return (nums, suffix_rank, natural)
+
+
+def vlabel(ref):
+    """Short display name for a version ref: 'releases/6.x.x/6.18.x/6.18.0_rc4' -> '6.18.0_rc4'."""
+    return ref.rsplit("/", 1)[-1] if ref else ref
+
+
+def tidy_versions(tags, vkey, rc_only=False):
+    """Per base version keep the final release (if any) plus only its latest pre-release (rc/beta/...)."""
+    groups = {}
+    for t in tags:
+        groups.setdefault(vkey(t)[0], []).append(t)
+    keep = set()
+    for g in groups.values():
+        finals = [t for t in g if vkey(t)[1] == 1]
+        pres = [t for t in g if vkey(t)[1] == 0]
+        if not (rc_only and pres):  # rc_only: a version that has rc branches shows just its highest rc
+            keep.update(finals)
+        if pres:
+            keep.add(max(pres, key=vkey))
+    return [t for t in tags if t in keep]
+
+
+def major_of(tag, vkey):
+    k = vkey(tag)
+    return k[0][0] if isinstance(k[0], tuple) else 0
 
 
 # ======================== GitHub ========================
@@ -796,6 +900,44 @@ def gitlab_list_branches(project_id, token, limit=100):
     return out
 
 
+def gitlab_list_release_branches(project_id, token, min_major=None):
+    """Branches named `releases/<major>.x.x/<minor>.x/<version>` — older versions that were never tagged or released.
+    With min_major, only those majors are requested from the server (older ones are never even listed)."""
+    def fetch(prefix):
+        out, page = {}, 1
+        while True:
+            data, hdrs = gitlab_api(f"projects/{project_id}/repository/branches", token,
+                                    {"search": prefix, "per_page": 100, "page": page})
+            for b in data or []:
+                name = b["name"]
+                if name.startswith("releases/") and re.search(r"\d", name.rsplit("/", 1)[-1]):
+                    c = b.get("commit") or {}
+                    out[name] = {"released_at": c.get("committed_date") or c.get("created_at")}
+            nxt = hdrs.get("x-next-page")
+            if not nxt:
+                return out
+            page = int(nxt)
+
+    if not min_major:
+        return fetch("releases/")
+    out = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:  # releases/6, releases/7, … (until well past any real major)
+        for part in ex.map(fetch, [f"releases/{m}" for m in range(min_major, min_major + 8)]):
+            out.update(part)
+    return {n: m for n, m in out.items() if re.match(rf"releases/\d+\.", n)}
+
+
+def add_release_branches(versions, branches):
+    """Add release branches whose version isn't already covered by a release/tag of the same version."""
+    norm = lambda n: re.sub(r"^[vV]\.?", "", n.rsplit("/", 1)[-1])
+    have = {norm(n) for n in versions}
+    for name, meta in sorted(branches.items()):
+        if norm(name) not in have:
+            versions[name] = meta
+            have.add(norm(name))
+    return versions
+
+
 def only_version_tags(tags):
     """Drop junk tags (e.g. 'latest', 'build-123') when some tags look like versions."""
     good = {k: v for k, v in tags.items() if re.match(r"^[vV]?\.?\d", k)}
@@ -853,7 +995,7 @@ def gitlab_search_version(project_id, project_path, ref, term, token, on_progres
 class VersionResult:
     def __init__(self, tag, date, matches, err=None):
         self.tag = tag
-        self.label = tag or "default branch"
+        self.label = vlabel(tag) or "default branch"
         self.date = date
         self.matches = matches
         self.err = err
@@ -1231,6 +1373,7 @@ class State:
         self.project_id = None    # GitLab only
         self.releases = None
         self.versions_are_branches = False
+        self.hidden_old = 0       # versions hidden by GITLAB_MIN_MAJOR
         self.vkey = version_key   # sort key for versions (by date when they are branches)
         self.range = None         # [(tag_or_None, meta_or_None)] ascending
         self.range_all = 0
@@ -1284,7 +1427,7 @@ class State:
 
         def lab(item):
             tag, meta = item
-            return f"{BOLD}{tag or 'default branch'}{RESET} {DIM}{fmt_date((meta or {}).get('released_at')) if tag else ''}{RESET}".rstrip()
+            return f"{BOLD}{vlabel(tag) or 'default branch'}{RESET} {DIM}{fmt_date((meta or {}).get('released_at')) if tag else ''}{RESET}".rstrip()
 
         if len(self.range) == 1:
             return lab(first)
@@ -1487,13 +1630,24 @@ def load_releases(state):
                 tags.update({k: v for k, v in rel.items() if v.get("released_at")})
                 rel = {**tags, **rel} if rel else tags
         else:
-            rel = gitlab_list_releases(state.project_id, state.gl_token)
-            if len(rel) < 2:
+            only_new = GITLAB_MIN_MAJOR.get(state.repo) if not os.environ.get("SDK_SLEUTH_ALL_VERSIONS") else None
+            branches = gitlab_list_release_branches(state.project_id, state.gl_token, only_new)
+            if state.repo in GITLAB_BRANCHES_ONLY and branches:
+                rel = branches
+            else:
+                rel = gitlab_list_releases(state.project_id, state.gl_token)
                 tags = only_version_tags(gitlab_list_tags(state.project_id, state.gl_token))
                 rel = {**tags, **rel} if rel else tags
+                # old versions often only exist as `releases/x.x.x/...` branches
+                add_release_branches(rel, branches)
             if not rel:
                 rel = gitlab_list_branches(state.project_id, state.gl_token)
                 state.versions_are_branches = bool(rel)
+        min_major = GITLAB_MIN_MAJOR.get(state.repo) if state.platform == "GitLab" else None
+        if min_major and not os.environ.get("SDK_SLEUTH_ALL_VERSIONS"):
+            kept = {t: m for t, m in rel.items() if major_of(t, version_key) >= min_major}
+            state.hidden_old = len(rel) - len(kept)
+            rel = kept or rel
         state.releases = rel
     if state.versions_are_branches:
         state.vkey = lambda t: (state.releases[t].get("released_at") or "", t)
@@ -1525,39 +1679,68 @@ def step_versions(state, direction):
         time.sleep(1.2)
         return "next"
 
-    tags = sorted(state.releases.keys(), key=state.vkey)
-    newest_first = list(reversed(tags))
+    tags = sorted(state.releases.keys(), key=state.vkey)          # every version (used for the scanned range)
+    shown = tidy_versions(tags, state.vkey, state.platform == "GitLab" and state.repo in GITLAB_BRANCHES_ONLY)                       # what the pickers offer
     default_item = (None, f"{GREEN}(default branch){RESET} {DIM}— latest code, no specific version{RESET}")
+    width = min(max([14] + [len(vlabel(t)) for t in shown]) + 2, 40)
 
     def item(tag):
         date = fmt_date(state.releases[tag].get("released_at"))
-        return (tag, f"{BOLD}{tag:<18}{RESET} {CYAN}{date}{RESET}")
+        return (tag, f"  {BOLD}{vlabel(tag):<{width}}{RESET} {CYAN}{date}{RESET}")
 
-    cols = f"VERSION            RELEASED (yyyy/mm/dd)"
-    from_items = [item(t) for t in tags] + [default_item]  # oldest -> newest
+    cols = f"  {'VERSION':<{width + 1}}RELEASED (yyyy/mm/dd)"
+    hint = f"{DIM}⏎ on a ▸ group opens it · type to search every version · latest rc only{RESET}"
 
-    def to_items(frm):
-        """Only versions from `frm` upwards, newest first (default branch counts as newest)."""
-        if frm is None:  # default branch has nothing newer: offer everything, newest first
-            return [default_item] + [item(t) for t in newest_first]
-        newer = [t for t in newest_first if state.vkey(t) >= state.vkey(frm)]
-        if state.mode == "compare":
-            newer = [t for t in newer if t != frm]
-        return [default_item] + [item(t) for t in newer]
+    def grouped(cands, newest_first):
+        """Majors as collapsible headers, every version listed after its header (the picker hides/shows them)."""
+        by_major = {}
+        for t in cands:
+            by_major.setdefault(major_of(t, state.vkey), []).append(t)
+        out, kinds = [], []
+        for mj in sorted(by_major, reverse=newest_first):
+            members = sorted(by_major[mj], key=state.vkey, reverse=newest_first)
+            out.append((("group", mj), f"{YELLOW}▸ {mj}.x{RESET}  {DIM}{len(members)} versions{RESET}"))
+            kinds.append(("g", mj, f"{YELLOW}▾ {mj}.x{RESET}  {DIM}{len(members)} versions{RESET}"))
+            for t in members:
+                out.append(item(t))
+                kinds.append(("v", mj, None))
+        return out, kinds
 
+    def pick(cands, prompt, header, newest_first, open_majors, lead=()):
+        body, kinds = grouped(cands, newest_first)
+        tail = [] if newest_first else [default_item]
+        items = list(lead) + body + tail
+        ks = [("a", None, None)] * len(lead) + kinds + [("a", None, None)] * len(tail)
+        return fzf_pick(items, prompt, header=header, kinds=ks, open_majors=open_majors)
+
+    from_open, to_open = set(), None
     phase, frm = "from", None
     while True:
         if phase == "from":
             screen(state, 3)
-            frm = fzf_pick(from_items, "From", header=f"Oldest version of the range · {len(tags)} {'branches' if state.versions_are_branches else 'versions'} · oldest first\n{cols}")
+            frm = pick(shown, "From",
+                       f"Oldest version of the range · {len(shown)} versions · oldest first"
+                       + (f" · {state.hidden_old} older hidden (v{GITLAB_MIN_MAJOR.get(state.repo)}+ only)" if state.hidden_old else "")
+                       + f"\n{hint}\n{cols}",
+                       False, from_open)
             if frm is BACK:
                 return "back"
             phase = "to"
         else:
-            screen(state, 3, subtitle=f"· from {frm or 'default branch'}")
-            to = fzf_pick(to_items(frm), "To", header=f"Newest version of the range (from {frm or 'default branch'} upwards) · newest first\n{cols}")
+            screen(state, 3, subtitle=f"· from {vlabel(frm) or 'default branch'}")
+            if frm is None:
+                newer = list(shown)
+            else:
+                newer = [t for t in shown if state.vkey(t) >= state.vkey(frm)]
+                if state.mode == "compare":
+                    newer = [t for t in newer if t != frm]
+            if to_open is None:
+                to_open = {major_of(max(newer, key=state.vkey), state.vkey)} if newer else set()
+            to = pick(newer, "To",
+                      f"Newest version of the range (from {vlabel(frm) or 'default branch'} upwards) · newest first\n{hint}\n{cols}",
+                      True, to_open, lead=[default_item])
             if to is BACK:
-                phase = "from"
+                phase, to_open = "from", None
                 continue
             break
 

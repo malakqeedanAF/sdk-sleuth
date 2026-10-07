@@ -19,11 +19,16 @@ All notable changes to sdk-sleuth are documented here.
 - Same expand/collapse viewer keys everywhere. `o` / `y` on a **diff line** open / copy the link to that exact line in the file (added & unchanged lines → new version, removed lines → old version); on a header they open the compare page. Diff line numbers are real file line numbers.
 
 ### Fixed
+- GitLab repos now also list `releases/x.x.x/...` branches as versions (e.g. `appsflyer-android-sdk` previously started at v6.15.2, its first formal Release). Branches whose version already has a release/tag are skipped; version pickers sort by the branch's last path segment.
 - Repos with fewer than two releases (e.g. one release but more tags) now also offer their git tags, so Compare works; `v.0.0.1`-style tags sort correctly.
 - GitLab repos with neither releases nor tags offer their branches (by last commit date) instead of default-branch-only.
 - Repos that tag versions without publishing formal Releases (e.g. `appsflyer.sdk.ios` on GitLab) now list their **git tags** (with commit dates) in the version pickers instead of falling back to the default branch only.
 
 ### Changed
+- **Android & iOS on GitLab use only the `releases/<major>.x.x/<minor>.x/<version>` branches** (no formal Releases or tags), with just the highest rc per version (e.g. `6.16.0-rc2`). Controlled by `GITLAB_BRANCHES_ONLY` in `sdk_sleuth.py`.
+- **Old SDKs hidden:** `GITLAB_MIN_MAJOR` (top of `sdk_sleuth.py`) limits Android and iOS on GitLab to v6.x.x+ (deprecated versions are never listed, scanned or even requested for `releases/…` branches, so loading and scans are faster). Edit the map to change/remove, or set `SDK_SLEUTH_ALL_VERSIONS=1` to show everything.
+- **Search works with collapsed groups:** typing in a version picker searches *every* version (exact match, e.g. `6.18.1`), not just the opened groups. Opening/closing a group happens inside the same fzf session — no screen flicker or restart, and the cursor stays on the group.
+- **Cleaner version pickers:** majors (4.x, 5.x, 6.x, 7.x …) are collapsible groups (⏎ to open; the newest major is open in *To*); names are short (`6.18.0_rc4`, not `releases/6.x.x/6.18.x/6.18.0_rc4`); each version lists the final release plus only its **latest** rc/beta. Rc numbers sort naturally (`_rc10` after `_rc9`). The scanned range still includes every version in between.
 - Results (search, symbol verdict, evolution, overview) now always open **fully collapsed**; expand with Enter, `1 2 3` or `e`.
 - Version pickers: **From** lists oldest → newest; **To** lists only From and newer, newest first.
 - The wizard now has 6 steps (Mode · Platform · Account · Repository · Versions · Search/Compare).
